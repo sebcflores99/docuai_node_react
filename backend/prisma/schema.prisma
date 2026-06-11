@@ -63,6 +63,10 @@ model Message {
   model            String?
   promptTokens     Int?
   completionTokens Int?
+  // AI-aware UX metadata (assistant messages). Confidence is normalized 0..1;
+  // sources holds the grounding passages (MessageSource[]) shown in the UI.
+  confidence       Float?
+  sources          Json?
   createdAt        DateTime       @default(now())
 
   @@index([conversationId])

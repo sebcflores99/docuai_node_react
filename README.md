@@ -99,20 +99,18 @@ This implementation covers **AI assistant that answers questions about uploaded 
 
 ### Quick Start (with Docker)
 
-1. **Clone & navigate to the repo**
+1. **Clone & navigate to repo**
    ```bash
    cd FS_AI_ENG_Assessment
    ```
 
-2. **Copy environment files**
+2. **Create `.env` from template**
    ```bash
-   # Create service-specific env files from examples
-   cp .env.backend .env.backend  # Fill in real OPENAI_API_KEY & JWT_SECRET
-   cp .env.postgres .env.postgres
-   cp .env.weaviate .env.weaviate
+   cp .env.example .env
+   # Edit .env and add your real OPENAI_API_KEY and JWT_SECRET
    ```
 
-3. **Start services using Makefile**
+3. **Start services**
    ```bash
    make up-d    # Start in background
    make logs    # View logs
@@ -120,7 +118,7 @@ This implementation covers **AI assistant that answers questions about uploaded 
 
 4. **Verify services**
    ```bash
-   make ps      # List running containers
+   make ps
    # Backend: http://localhost:8000/health
    # Frontend: http://localhost:3000
    # Weaviate: http://localhost:8080
@@ -139,10 +137,10 @@ This implementation covers **AI assistant that answers questions about uploaded 
 cd backend
 pnpm install
 
-# Create local .env file
+# Create .env from template
 cp .env.example .env
 
-# Run Prisma migrations
+# Run migrations
 pnpm prisma:migrate
 
 # Start dev server
@@ -157,27 +155,25 @@ pnpm install
 pnpm dev  # Runs on http://localhost:3000
 ```
 
-### Environment Variables
+### Environment Setup
 
-Create `.env.*` files from the `.env.*.example` templates:
+Create `.env` file from `.env.example`:
 
-**`.env.backend`** — Backend secrets
 ```env
-OPENAI_API_KEY=sk-...        # Your OpenAI API key
-JWT_SECRET=<generate-random> # Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-LLM_PROVIDER=openai          # Switch: openai | anthropic
+# OpenAI API Key — used by backend & Weaviate text2vec-openai
+OPENAI_API_KEY=sk-...
+
+# JWT signing secret — generate with:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+JWT_SECRET=your-secret-here
+
+# LLM provider (openai | anthropic)
+LLM_PROVIDER=openai
 ```
 
-**`.env.postgres`** — PostgreSQL credentials
-```env
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_DB=docuai
-```
-
-**`.env.weaviate`** — Vector DB secrets
-```env
-OPENAI_APIKEY=sk-...  # Same as backend for text2vec-openai
+**For local backend dev**, copy `.env` to `backend/.env`:
+```bash
+cp .env backend/.env
 ```
 
 ---
@@ -186,7 +182,7 @@ OPENAI_APIKEY=sk-...  # Same as backend for text2vec-openai
 
 ### Authentication
 
-All endpoints (except `/health`) require JWT authentication in the `Authorization` header:
+All endpoints (except `/health`) require JWT:
 
 ```http
 Authorization: Bearer <JWT_TOKEN>
@@ -198,7 +194,6 @@ Authorization: Bearer <JWT_TOKEN>
 ```http
 GET /health
 ```
-✅ Public endpoint — no auth required.
 
 **Response:**
 ```json
@@ -209,7 +204,7 @@ GET /health
 }
 ```
 
-#### Login / Register
+#### Login
 ```http
 POST /auth/login
 Content-Type: application/json
@@ -224,10 +219,7 @@ Content-Type: application/json
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
-  "user": {
-    "id": "user-123",
-    "email": "user@example.com"
-  }
+  "user": {"id": "user-123", "email": "user@example.com"}
 }
 ```
 
@@ -239,7 +231,7 @@ Content-Type: application/json
 
 {
   "documentId": "doc-123",
-  "question": "What are the key findings in this document?",
+  "question": "What are the key findings?",
   "context": "previous-message-id"
 }
 ```
@@ -250,13 +242,7 @@ Content-Type: application/json
   "messageId": "msg-456",
   "answer": "Based on the document...",
   "confidence": 0.92,
-  "sources": [
-    {
-      "documentId": "doc-123",
-      "excerpt": "...",
-      "score": 0.95
-    }
-  ],
+  "sources": [{"documentId": "doc-123", "excerpt": "...", "score": 0.95}],
   "status": "completed",
   "processingTime": 1250
 }
@@ -268,13 +254,12 @@ Content-Type: application/json
 
 ### LLM Provider Abstraction
 
-The backend abstracts LLM provider details to enable:
-- **Easy switching** between OpenAI, Anthropic, etc.
-- **Testing** with mocked providers
-- **Cost control** and rate limiting per provider
-- **Prompt versioning** independent of model changes
+Abstracts LLM provider details to enable:
+- Easy switching between OpenAI, Anthropic, etc.
+- Testing with mocked providers
+- Cost control and rate limiting per provider
+- Prompt versioning independent of model changes
 
-**Architecture:**
 ```typescript
 interface LLMProvider {
   invoke(prompt: string, options: InvokeOptions): Promise<LLMResponse>;
@@ -286,24 +271,24 @@ interface LLMProvider {
 ### Prompt Construction & Safety
 
 **Injection Prevention:**
-1. **Input Validation** — Strip/escape special characters before embedding in prompts
-2. **Parametric Queries** — Use structured format specs instead of string concatenation
-3. **Length Limits** — Cap questions/context to prevent token abuse
-4. **Schema Enforcement** — Validate LLM responses against expected JSON schema
+1. Input validation — strip/escape special characters before embedding
+2. Parametric queries — structured format specs instead of concatenation
+3. Length limits — cap question/context to prevent token abuse
+4. Schema enforcement — validate LLM responses against expected JSON
 
 ### Cost & Rate Limiting
 
 ```typescript
 class RateLimiter {
   private tokenBudget = {
-    openai: 1_000_000 / 30,      // ~33k tokens/day
-    anthropic: 100_000_000 / 30  // ~3.3M tokens/day
+    openai: 1_000_000 / 30,       // ~33k tokens/day
+    anthropic: 100_000_000 / 30   // ~3.3M tokens/day
   };
 
   async checkLimit(provider: string, tokens: number): Promise<void> {
     const remaining = await this.getRemaining(provider);
     if (remaining < tokens) {
-      throw new Error(`Rate limit exceeded for ${provider}`);
+      throw new Error(`Rate limit exceeded`);
     }
   }
 }
@@ -312,75 +297,74 @@ class RateLimiter {
 ### Vector Search Integration (RAG)
 
 **Flow:**
-1. User uploads document → Extract text & generate embeddings
-2. Embeddings stored in Weaviate with document metadata
-3. User asks question → Generate embedding for question
+1. User uploads document → extract text & generate embeddings
+2. Embeddings stored in Weaviate with metadata
+3. User asks question → generate embedding for question
 4. Semantic search retrieves top-K similar passages
-5. Pass retrieved context to LLM for grounded answer
+5. Pass context to LLM for grounded answer
 
-**Chunking Strategy:**
-- 500-token chunks with 100-token overlap
-- Preserves document continuity
-- Enables efficient retrieval
+**Chunking:** 500-token chunks with 100-token overlap
 
-### Handling Hallucinations & Uncertainty
+### Handling Hallucinations
 
-1. **Confidence Scoring** — Track when LLM deviates from retrieved context
-2. **Citation Enforcement** — Require LLM to cite sources for factual claims
-3. **Fallback to Retrieval** — If confidence < threshold, return top passages directly
-4. **Explicit Uncertainty** — LLM trained to say "I don't know" when context insufficient
+1. **Confidence scoring** — track LLM deviation from retrieved context
+2. **Citation enforcement** — require sources for factual claims
+3. **Fallback retrieval** — return top passages if confidence < threshold
+4. **Explicit uncertainty** — LLM trained to say "I don't know"
 
 ---
 
 ## Security & Secrets Management
 
-### Secrets Handling
+### Secrets Approach
 
-All sensitive data is isolated in **service-specific `.env` files** and never committed:
+**Single `.env` file for the entire stack:**
 
 ```
-Root level - architecture documentation
-.env.example
-
-Service-specific - NEVER committed (in .gitignore)
-.env.backend      ← Backend secrets (OPENAI_API_KEY, JWT_SECRET)
-.env.postgres     ← DB credentials
-.env.weaviate     ← Vector DB API keys
+.env              ← Shared secrets (never committed, in .gitignore)
+                    Contains: OPENAI_API_KEY, JWT_SECRET
+                    Loaded by: backend, weaviate
 ```
+
+**Why simple is better:**
+- ✅ Single source of truth
+- ✅ Easy rotation (update `.env`, restart services)
+- ✅ No duplication across multiple env files
+- ✅ Postgres credentials stay inline (not sensitive in dev)
 
 ### Docker Compose Integration
 
-Each service loads secrets via `env_file`:
-
 ```yaml
-services:
-  backend:
-    env_file:
-      - .env.backend    # Loads OPENAI_API_KEY, JWT_SECRET
-    environment:
-      - NODE_ENV=development  # Non-sensitive config
-      
-  postgres:
-    env_file:
-      - .env.postgres   # Loads POSTGRES_USER, POSTGRES_PASSWORD
+backend:
+  env_file:
+    - .env          # Loads OPENAI_API_KEY, JWT_SECRET
+
+weaviate:
+  env_file:
+    - .env          # Loads OPENAI_APIKEY for text2vec-openai
+
+postgres:
+  environment:
+    POSTGRES_USER: postgres           # Dev defaults
+    POSTGRES_PASSWORD: postgres       # (inline, not sensitive)
+    POSTGRES_DB: docuai
 ```
 
 ### JWT Implementation
 
-- **Secret**: 256-bit random hex (generated at setup)
-- **Algorithm**: HS256 (HMAC-SHA256)
-- **Expiration**: 7 days for session tokens
-- **Rotation**: Implement via `/auth/refresh` endpoint
+- **Secret**: 256-bit random hex
+- **Algorithm**: HS256
+- **Expiration**: 7 days
+- **Rotation**: Via `/auth/refresh` endpoint
 
 ### API Key Rotation (Production)
 
 ```bash
-# Rotate OpenAI API key without downtime:
 1. Generate new key in OpenAI dashboard
-2. Update .env.backend with new key
-3. Redeploy backend: make restart
+2. Update .env with new key
+3. Redeploy: make restart
 4. Monitor logs for successful auth
-5. Delete old key from OpenAI dashboard
+5. Delete old key
 ```
 
 ---
@@ -389,22 +373,16 @@ services:
 
 ### Data Retention Policy
 
-| Data Type             | Storage      | Retention  | Rationale                    |
-|-----------------------|--------------|------------|------------------------------|
-| User Credentials      | PostgreSQL   | Until deletion | Must persist securely         |
-| Documents             | PostgreSQL   | Until deletion | User-owned content            |
-| AI Embeddings         | Weaviate     | Until deletion | Required for semantic search  |
-| Conversation History  | PostgreSQL   | 90 days    | Audit trail & UX context     |
-| API Logs              | Application  | 30 days    | Debugging, no PII stored      |
-| OpenAI Responses      | PostgreSQL   | 90 days    | Quality evaluation & reuse    |
+| Data Type          | Storage   | Retention | Rationale                  |
+|--------------------|-----------|-----------|----------------------------|
+| User Credentials   | Postgres  | Until deletion | Must persist securely   |
+| Documents          | Postgres  | Until deletion | User-owned content      |
+| AI Embeddings      | Weaviate  | Until deletion | Required for search     |
+| Conversation       | Postgres  | 90 days   | Audit trail & UX context   |
+| API Logs           | App       | 30 days   | Debugging, no PII stored   |
+| OpenAI Responses   | Postgres  | 90 days   | Quality evaluation      |
 
 ### PII Handling
-
-**What's considered PII:**
-- User email addresses
-- Document file names
-- User question history
-- AI response text with user-specific data
 
 **Safeguards:**
 1. Database encryption for sensitive fields
@@ -412,22 +390,10 @@ services:
 3. Data anonymization for AI training
 4. Hard delete all user data on account termination
 
-### Document Processing Pipeline
+### Document Processing
 
 ```
-User Upload
-    ↓
-Virus Scan (optional)
-    ↓
-Extract Text
-    ↓
-Split into Chunks (500 tokens, 100 overlap)
-    ↓
-Generate Embeddings (text2vec-openai)
-    ↓
-Store in PostgreSQL (metadata) + Weaviate (vectors)
-    ↓
-Ready for Q&A
+Upload → Scan → Extract → Chunk → Embed → Store → Ready
 ```
 
 ---
@@ -436,175 +402,152 @@ Ready for Q&A
 
 ### Architecture Trade-offs
 
-| Decision                    | Trade-off                                  | Rationale                           |
-|-----------------------------|-------------------------------------------|-------------------------------------|
-| Single Backend Instance     | No horizontal scaling out-of-box           | Simplifies for assessment; extend with load balancing |
-| Synchronous LLM Calls       | Blocks during LLM latency (5-20s)          | Simpler MVP; async via Bull in production |
-| Vector DB Local             | Single point of failure; no replication    | Dev-friendly; use managed Weaviate Cloud in production |
-| JWT Stateless Auth          | Can't revoke tokens immediately            | Add Redis token blacklist for production logout |
-| No Document Versioning      | Users can't access historical states       | Could implement via Prisma soft deletes |
+| Decision           | Trade-off                        | Mitigation                            |
+|--------------------|---------------------------------|---------------------------------------|
+| Single Backend     | No horizontal scaling            | Add load balancing + multiple instances |
+| Sync LLM Calls     | Blocks during latency (5-20s)    | Async via Bull queues in production   |
+| Vector DB Local    | Single point of failure          | Use managed Weaviate Cloud in prod    |
+| Stateless JWT      | Can't revoke immediately         | Redis token blacklist for production  |
 
 ### AI Limitations
 
-1. **Hallucinations** — LLM may fabricate facts outside retrieved context
-   - Mitigation: Enforce citation requirements; score confidence; show sources
+1. **Hallucinations** — LLM may fabricate facts
+   - Mitigation: Citations, confidence scoring, source display
 
-2. **Context Window** — Large documents exceed LLM token limits
-   - Mitigation: Chunking with overlap; summarization; multi-hop retrieval
+2. **Context Window** — Large documents exceed token limits
+   - Mitigation: Chunking, summarization, multi-hop retrieval
 
-3. **Semantic Gaps** — Embedding models may miss nuanced relationships
-   - Mitigation: Hybrid search (keyword + semantic); human feedback loops
+3. **Semantic Gaps** — Embeddings miss nuanced relationships
+   - Mitigation: Hybrid search (keyword + semantic), human feedback
 
-4. **Cost at Scale** — OpenAI API costs scale with usage
-   - Mitigation: Caching, batching, cheaper models (GPT-3.5), self-hosted inference
+4. **Cost at Scale** — API costs scale with usage
+   - Mitigation: Caching, batching, cheaper models, self-hosted inference
 
 ---
 
 ## Bonus Implementations
 
-### Vector Store Integration (Implemented ✅)
+### Vector Store (Implemented ✅)
+- Weaviate 1.24.6
+- OpenAI embeddings (1536 dimensions)
+- Semantic similarity search
+- 500-token chunks with 100-token overlap
 
-- **Vector DB**: Weaviate 1.24.6
-- **Embeddings**: OpenAI text-embedding-3-small (1536 dimensions)
-- **Retrieval**: Semantic similarity search with cosine distance
-- **Chunking**: 500-token chunks with 100-token overlap
-
-### Async Processing (Ready for Implementation)
-
+### Async Processing (Ready)
 ```typescript
-// Future: Bull queue for background jobs
-import Queue from 'bull';
-
-const documentProcessingQueue = new Queue('document-processing');
-
-documentProcessingQueue.process(async (job) => {
-  const { documentId } = job.data;
-  // Extract text, generate embeddings, store
-  // Send notification when done
+const queue = new Queue('document-processing');
+queue.process(async (job) => {
+  // Generate embeddings, store, notify frontend
 });
 ```
 
-### Streaming Responses (Ready for Implementation)
-
+### Streaming Responses (Ready)
 ```typescript
-// Future: SSE for token-by-token streaming
-app.get('/chat/ask-stream', async (req, res) => {
+app.get('/chat/ask-stream', (res) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  
-  const stream = await llmProvider.invokeStream(prompt);
-  stream.on('data', (chunk) => {
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-  });
+  // Stream tokens as they arrive
 });
 ```
 
 ### Cost Estimation
 
-For **1k / 10k / 100k requests**:
-
 | Metric | 1k Requests | 10k Requests | 100k Requests |
 |--------|-------------|--------------|---------------|
-| OpenAI API | $2-5 | $20-50 | $200-500 |
-| Weaviate (self-hosted) | $0 | $0 | $0 |
-| PostgreSQL (AWS RDS) | $10/mo | $25/mo | $50/mo |
-| **Total Monthly** | ~$15 | ~$50 | ~$300 |
+| OpenAI | $2-5 | $20-50 | $200-500 |
+| Weaviate | $0 | $0 | $0 |
+| Postgres | $10/mo | $25/mo | $50/mo |
+| **Total** | ~$15 | ~$50 | ~$300 |
 
 ---
 
-## Infrastructure & Deployment (Future)
+## Infrastructure & Deployment
 
-### AWS Deployment Strategy
+### AWS Strategy
 
 ```yaml
 Compute:
-  - ECS Fargate for backend (serverless, auto-scaling)
-  - CloudFront for frontend CDN
-  - RDS Postgres for primary DB
+  - ECS Fargate (serverless, auto-scaling)
+  - CloudFront CDN for frontend
+  - RDS Postgres managed
 
-AI & Vector Search:
+AI:
   - Weaviate Cloud managed service
-  - OpenAI API (no self-hosting)
+  - OpenAI API
 
 Secrets:
   - AWS Secrets Manager for API keys
-  - IAM roles for service authentication
+  - IAM roles for authentication
 
-Infrastructure as Code:
-  - Terraform modules for reproducible deployment
-  - Separate .tfvars for dev/staging/prod
+IaC:
+  - Terraform modules
+  - Separate tfvars for dev/staging/prod
 ```
 
-### Scaling Constraints for AI Workloads
+### Scaling AI Workloads
 
-1. **LLM API Rate Limits** — OpenAI rate-limits by tokens/min; implement queue
-2. **Embedding Generation** — Batch embeddings; cache repeated documents
-3. **Vector DB** — Index refresh latency during bulk loads
-4. **Database Connections** — Pool connections; close idle after 5min
+1. **LLM rate limits** — Implement request queue
+2. **Embedding generation** — Batch & cache
+3. **Vector DB indexing** — Manage refresh latency
+4. **Database connections** — Connection pooling
 
 ---
 
-## Making Changes
+## Development
 
 ### Code Structure
 
 ```
 backend/
 ├── src/
-│   ├── api/
-│   │   ├── routes/          # Express routes
-│   │   └── middleware/       # Auth, validation, error handling
-│   ├── services/
-│   │   ├── llm/             # LLM provider abstraction
-│   │   ├── rag/             # RAG & vector search
-│   │   └── auth/            # JWT & authentication
-│   ├── config/
-│   │   ├── env.ts           # Environment configuration
-│   │   └── prisma.ts        # Prisma client setup
-│   └── index.ts             # Entry point
-├── prisma/
-│   ├── schema.prisma        # Database schema
-│   └── migrations/          # Schema migrations
+│   ├── api/routes/
+│   ├── services/{llm,rag,auth}/
+│   ├── config/{env,prisma}/
+│   └── index.ts
+├── prisma/{schema,migrations}/
+└── Dockerfile
+
+frontend/
+├── src/{pages,components,services,hooks}/
 └── Dockerfile
 ```
 
-### Development Workflow
+### Workflow
 
-1. Create a feature branch: `git checkout -b feature/my-feature`
-2. Implement & test locally: `make up-d && make logs`
-3. Commit with conventional commits: `git commit -m "feat: description"`
-4. Push & open a PR
-5. Ensure tests pass before merging
+1. Create branch: `git checkout -b feature/my-feature`
+2. Implement & test locally
+3. Commit: `git commit -m "feat: description"`
+4. Push & open PR
 
 ---
 
 ## Troubleshooting
 
 ### Backend fails to start
-- Check `.env.backend` has valid `OPENAI_API_KEY`
-- Verify PostgreSQL is running: `make ps`
+- Check `.env` has valid `OPENAI_API_KEY`
+- Verify Postgres running: `make ps`
 - Check logs: `make logs-backend`
 
 ### Frontend can't reach backend
-- Verify backend is running on `localhost:8000`
-- Check CORS config in `backend/src/index.ts`
+- Verify backend on `localhost:8000`: `make ps`
+- Check CORS config
 - Clear browser cache (Ctrl+Shift+R)
 
 ### Weaviate connection fails
-- Verify Weaviate is healthy: `make ps`
-- Check `.env.weaviate` has valid `OPENAI_APIKEY`
-- Inspect logs: `make logs-weaviate`
+- Verify healthy: `make ps`
+- Check `.env` has `OPENAI_APIKEY`
+- Check logs: `make logs-weaviate`
 
-### Out of memory errors
-- Reduce document chunk size in `RagService`
-- Limit concurrent embedding jobs to 3-5
-- Use managed Weaviate Cloud instead of self-hosted
+### Out of memory
+- Reduce chunk size
+- Limit concurrent embeddings to 3-5
+- Use managed Weaviate Cloud
 
 ---
 
 ## License
 
-ISC — See LICENSE file for details.
+ISC — See LICENSE file.
 
 ---
 
-**Questions?** Open an issue or review the assessment in `docs/Full_Stack_AI_Engineer_Assessment\ \(1\).md`.
+**Questions?** See `docs/Full_Stack_AI_Engineer_Assessment\ \(1\).md`.
