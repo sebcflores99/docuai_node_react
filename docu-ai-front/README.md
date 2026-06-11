@@ -15,11 +15,11 @@ and live status.
 
 ## Pages
 
-| Route                          | Page          | Purpose                                            |
-| ------------------------------ | ------------- | -------------------------------------------------- |
-| `/login`                       | Login / Sign‑up | Authenticate (toggle between login and register).  |
-| `/documents`                   | Documents (Input) | Submit a new document and browse existing ones.    |
-| `/documents/:documentId/chat`  | Chat (Results)  | Ask the assistant questions about a document.       |
+| Route                       | Page              | Purpose                                                        |
+| --------------------------- | ----------------- | -------------------------------------------------------------- |
+| `/login`                    | Login / Sign‑up   | Authenticate via a clear tabbed switch between log in and sign up. |
+| `/documents`                | Documents         | Upload document files, watch ingestion progress, delete.       |
+| `/chat`, `/chat/:id`        | Chat              | Ask questions answered across **all** ready documents; answers cite sources. |
 
 All routes except `/login` are protected and redirect unauthenticated users.
 
@@ -32,23 +32,35 @@ All routes except `/login` are protected and redirect unauthenticated users.
 - **Uncertainty handling** — assistant answers show a confidence badge
   (high/medium/low). Low‑confidence answers display a warning prompting the user to
   verify against the source.
-- **Grounding sources** — answers list the document passages they relied on, plus
-  model and token metadata.
+- **Grounding sources** — answers list the document passages they relied on (with
+  page), plus model and token metadata.
+- **Document processing feedback** — uploads show a progress bar and a status badge
+  (Processing → Ready / Failed).
 - **Loading / error / empty states** — consistent primitives across every page.
+
+## Forms & validation
+
+All forms validate client‑side with **zod** (`src/validation/schemas.ts`) before any
+request: login, sign‑up (with password confirmation + match check), document upload
+(file type/size), and the chat message box. Errors render inline per field.
 
 ## Project structure
 
 ```
 src/
   api/         # Typed fetch client + per-resource API modules
-    client.ts        # fetch wrapper, JWT handling, ApiError
+    client.ts        # fetch wrapper (JSON + FormData), JWT handling, ApiError
     auth.ts          # login / register / me
-    documents.ts     # CRUD for documents
-    conversations.ts # conversations + messages
+    documents.ts     # list / get / upload (multipart) / delete
+    conversations.ts # conversations + messages (cross-document)
   auth/        # AuthContext, provider, useAuth hook, ProtectedRoute
-  components/  # Layout, States, MessageBubble, ModelStatus, Confidence, badges
+  components/  # Layout, States, MessageBubble, ModelStatus, Confidence,
+               # ProgressBar, DocumentUpload, ConversationList, DocumentScope
+  hooks/       # useDocuments (list + progress polling)
+  lib/         # formatting helpers
   pages/       # LoginPage, DocumentsPage, ChatPage
-  types/       # Domain types mirroring the backend Prisma schema
+  validation/  # zod schemas + validate() helper
+  types/       # Domain types
 ```
 
 ## Backend API contract
@@ -57,27 +69,27 @@ The frontend talks to the backend over REST. Base URL comes from `VITE_API_URL`
 (default `http://localhost:8000/api`). Authenticated requests send
 `Authorization: Bearer <jwt>`.
 
-> Note: the backend currently implements only the health endpoints. The contract
-> below is derived from the backend Prisma schema and is what this frontend codes
-> against — it documents the endpoints the backend needs to implement.
+> ⚠️ This contract is what the frontend codes against. Items marked **(NEW)** are
+> not yet implemented by the backend — see `docs/FRONTEND_API_CONTRACT.md` for the
+> exact backend changes required.
 
-| Method & path                          | Body                      | Returns                                  |
-| -------------------------------------- | ------------------------- | ---------------------------------------- |
-| `POST /auth/register`                  | `{ email, password }`     | `{ token, user }`                        |
-| `POST /auth/login`                     | `{ email, password }`     | `{ token, user }`                        |
-| `GET  /auth/me`                        | —                         | `{ user }`                               |
-| `GET  /documents`                      | —                         | `Document[]`                             |
-| `POST /documents`                      | `{ title, content }`      | `Document`                               |
-| `GET  /documents/:id`                  | —                         | `Document`                               |
-| `DELETE /documents/:id`                | —                         | `204`                                    |
-| `GET  /conversations?documentId=`      | —                         | `Conversation[]`                         |
-| `POST /conversations`                  | `{ documentId, title? }`  | `Conversation`                           |
-| `GET  /conversations/:id`              | —                         | `Conversation` (with `messages`)         |
-| `POST /conversations/:id/messages`     | `{ content }`             | `{ userMessage, assistantMessage }`      |
+| Method & path                       | Body                                  | Returns                              |
+| ----------------------------------- | ------------------------------------- | ------------------------------------ |
+| `POST /auth/register`               | `{ email, password }`                 | `{ token, user }`                    |
+| `POST /auth/login`                  | `{ email, password }`                 | `{ token, user }`                    |
+| `GET  /auth/me`                     | —                                     | `{ user }`                           |
+| `GET  /documents`                   | —                                     | `Document[]`                         |
+| `POST /documents` **(NEW)**         | `multipart/form-data`: `file`, `title?` | `Document` (`status:PROCESSING`)  |
+| `GET  /documents/:id`               | —                                     | `Document` (incl. `progress`) **(NEW field)** |
+| `DELETE /documents/:id`             | —                                     | `204`                                |
+| `GET  /conversations`               | —                                     | `Conversation[]`                     |
+| `POST /conversations` **(NEW)**     | `{ title?, documentIds? }` (no required doc) | `Conversation`                |
+| `GET  /conversations/:id`           | —                                     | `Conversation` (with `messages`)     |
+| `POST /conversations/:id/messages`  | `{ content, documentIds? }` **(NEW field)** | `{ userMessage, assistantMessage }` |
 
-The assistant `Message` may include AI metadata: `model`, `promptTokens`,
+The assistant `Message` includes AI metadata: `model`, `promptTokens`,
 `completionTokens`, `confidence` (0–1), and `sources[]` (`{ documentId,
-documentTitle?, snippet, score? }`). See `src/types/index.ts`.
+documentTitle?, snippet, score?, page? }`). See `src/types/index.ts`.
 
 ## Local development
 

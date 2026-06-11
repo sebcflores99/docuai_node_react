@@ -1,121 +1,78 @@
-import { useCallback, useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Document } from '../types';
 import * as docsApi from '../api/documents';
 import { ApiError } from '../api/client';
+import { useDocuments } from '../hooks/useDocuments';
 import { Loading, ErrorState, EmptyState } from '../components/States';
 import { DocumentStatusBadge } from '../components/DocumentStatusBadge';
+import { DocumentUpload } from '../components/DocumentUpload';
+import { ProgressBar } from '../components/ProgressBar';
+import { formatBytes, formatDate } from '../lib/format';
 
-// "Input" page: submit new documents and browse existing ones.
+// Documents management: upload files, watch ingestion progress, delete.
 export function DocumentsPage() {
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reloadKey, setReloadKey] = useState(0);
+  const { documents, loading, error, retry, addDocument, removeDocument } =
+    useDocuments();
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
-  const [title, setTitle] = useState('');
-  const [content, setContent] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        const docs = await docsApi.listDocuments();
-        if (!active) return;
-        setDocuments(docs);
-        setError(null);
-      } catch (err) {
-        if (!active) return;
-        setError(err instanceof ApiError ? err.message : 'Failed to load documents.');
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, [reloadKey]);
-
-  const retry = useCallback(() => {
-    setLoading(true);
-    setError(null);
-    setReloadKey((k) => k + 1);
-  }, []);
-
-  async function handleCreate(e: FormEvent) {
-    e.preventDefault();
-    setFormError(null);
-    setSubmitting(true);
+  async function handleUpload(file: File, title?: string) {
+    setUploadError(null);
+    setUploading(true);
     try {
-      const doc = await docsApi.createDocument(title.trim(), content.trim());
-      setDocuments((prev) => [doc, ...prev]);
-      setTitle('');
-      setContent('');
+      const doc = await docsApi.uploadDocument(file, title);
+      addDocument(doc); // useDocuments will poll until READY/FAILED
     } catch (err) {
-      setFormError(
-        err instanceof ApiError ? err.message : 'Failed to create document.',
+      setUploadError(
+        err instanceof ApiError ? err.message : 'Upload failed. Please try again.',
       );
     } finally {
-      setSubmitting(false);
+      setUploading(false);
     }
   }
 
-  async function handleDelete(id: string) {
-    const previous = documents;
-    setDocuments((prev) => prev.filter((d) => d.id !== id));
+  async function handleDelete(doc: Document) {
+    if (!window.confirm(`Delete "${doc.title}"? This can't be undone.`)) return;
+    removeDocument(doc.id);
     try {
-      await docsApi.deleteDocument(id);
+      await docsApi.deleteDocument(doc.id);
     } catch {
-      setDocuments(previous);
+      retry(); // restore from server on failure
     }
   }
+
+  const readyCount = documents.filter((d) => d.status === 'READY').length;
 
   return (
     <div className="documents-page">
+      <header className="page-head">
+        <div>
+          <h1>Documents</h1>
+          <p className="muted">
+            Upload documents to make them searchable. Once a document is{' '}
+            <strong>Ready</strong>, ask about it from any chat.
+          </p>
+        </div>
+        <Link to="/chat" className="btn btn-primary">
+          Go to chat →
+        </Link>
+      </header>
+
       <section className="card">
-        <h1>Add a document</h1>
-        <p className="muted">
-          Paste text content. Once processed, you can ask the assistant questions
-          about it.
-        </p>
-        <form onSubmit={handleCreate} className="form">
-          <label className="field">
-            <span>Title</span>
-            <input
-              type="text"
-              required
-              maxLength={200}
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g. Q3 Financial Report"
-            />
-          </label>
-          <label className="field">
-            <span>Content</span>
-            <textarea
-              required
-              rows={8}
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              placeholder="Paste the document text here…"
-            />
-          </label>
-          {formError && <p className="form-error" role="alert">{formError}</p>}
-          <button
-            type="submit"
-            className="btn btn-primary"
-            disabled={submitting || !title.trim() || !content.trim()}
-          >
-            {submitting ? 'Uploading…' : 'Add document'}
-          </button>
-        </form>
+        <h2>Upload a document</h2>
+        <DocumentUpload onUpload={handleUpload} busy={uploading} />
+        {uploadError && <p className="form-error" role="alert">{uploadError}</p>}
       </section>
 
       <section className="documents-list">
-        <h2>Your documents</h2>
+        <div className="documents-list-head">
+          <h2>Your documents</h2>
+          {readyCount > 0 && (
+            <span className="muted">{readyCount} ready</span>
+          )}
+        </div>
+
         {loading ? (
           <Loading label="Loading documents…" />
         ) : error ? (
@@ -123,29 +80,51 @@ export function DocumentsPage() {
         ) : documents.length === 0 ? (
           <EmptyState
             title="No documents yet"
-            detail="Add your first document above to start asking questions."
+            detail="Upload your first document above to start asking questions."
           />
         ) : (
           <ul className="doc-cards">
             {documents.map((doc) => (
               <li key={doc.id} className="card doc-card">
                 <div className="doc-card-head">
-                  <h3>{doc.title}</h3>
+                  <div className="doc-card-title">
+                    <span className="doc-icon" aria-hidden="true">📄</span>
+                    <h3>{doc.title}</h3>
+                  </div>
                   <DocumentStatusBadge status={doc.status} />
                 </div>
-                <p className="doc-preview">{doc.content.slice(0, 160)}…</p>
+
+                <div className="doc-meta">
+                  {doc.fileName && <span>{doc.fileName}</span>}
+                  {doc.sizeBytes ? <span>{formatBytes(doc.sizeBytes)}</span> : null}
+                  <span>Added {formatDate(doc.createdAt)}</span>
+                </div>
+
+                {(doc.status === 'PROCESSING' || doc.status === 'PENDING') && (
+                  <ProgressBar value={doc.progress} label="Processing…" />
+                )}
+
+                {doc.status === 'FAILED' && (
+                  <p className="doc-error" role="alert">
+                    Processing failed{doc.error ? `: ${doc.error}` : ''}. Try deleting
+                    and re-uploading.
+                  </p>
+                )}
+
                 <div className="doc-card-actions">
-                  <Link
-                    to={`/documents/${doc.id}/chat`}
-                    className="btn btn-primary btn-sm"
-                    aria-disabled={doc.status !== 'READY'}
-                  >
-                    Ask questions
-                  </Link>
+                  {doc.status === 'READY' ? (
+                    <Link to="/chat" className="btn btn-primary btn-sm">
+                      Ask in chat
+                    </Link>
+                  ) : (
+                    <button type="button" className="btn btn-sm" disabled>
+                      {doc.status === 'FAILED' ? 'Unavailable' : 'Preparing…'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn btn-ghost btn-sm"
-                    onClick={() => handleDelete(doc.id)}
+                    onClick={() => handleDelete(doc)}
                   >
                     Delete
                   </button>

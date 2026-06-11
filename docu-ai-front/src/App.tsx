@@ -17,9 +17,10 @@ function App() {
             </ProtectedRoute>
           }
         >
-          <Route index element={<Navigate to="/documents" replace />} />
+          <Route index element={<Navigate to="/chat" replace />} />
           <Route path="/documents" element={<DocumentsPage />} />
-          <Route path="/documents/:documentId/chat" element={<ChatPage />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:conversationId" element={<ChatPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
