@@ -381,6 +381,10 @@ p {
 .source-score {
   color: var(--text);
 }
+.source-page {
+  color: var(--muted);
+  font-size: 12px;
+}
 .message-meta {
   margin-top: 10px;
   display: flex;

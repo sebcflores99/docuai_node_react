@@ -17,4 +17,8 @@ export const env = {
   jwtSecret: process.env.JWT_SECRET ?? '',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '7d',
   llmProvider: process.env.LLM_PROVIDER ?? 'openai',
+  // Embeddings auto-select OpenAI when a key is present, else the offline mock.
+  embeddingProvider:
+    process.env.EMBEDDING_PROVIDER ?? (process.env.OPENAI_API_KEY ? 'openai' : 'mock'),
+  embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 } as const;

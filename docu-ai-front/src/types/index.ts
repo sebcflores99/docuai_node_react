@@ -32,6 +32,8 @@ export interface MessageSource {
   documentTitle?: string;
   snippet: string;
   score?: number;
+  // Human-readable page range the snippet came from, e.g. "1" or "1–2".
+  page?: string;
 }
 
 export interface Message {

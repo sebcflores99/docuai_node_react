@@ -35,7 +35,9 @@ export function MessageBubble({
           <ul>
             {message.sources.map((s, i) => (
               <li key={i}>
-                {s.documentTitle && <strong>{s.documentTitle}: </strong>}
+                {s.documentTitle && <strong>{s.documentTitle}</strong>}
+                {s.page && <span className="source-page"> (p. {s.page})</span>}
+                {s.documentTitle && ': '}
                 <span className="source-snippet">“{s.snippet}”</span>
                 {typeof s.score === 'number' && (
                   <span className="source-score"> ({s.score.toFixed(2)})</span>

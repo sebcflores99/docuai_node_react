@@ -9,6 +9,14 @@ import {
 } from './ai/ai.service';
 import type { Confidence } from './ai/postProcess';
 import type { LLMMessage } from './ai/providers/types';
+import * as rag from './rag/rag.service';
+import type { RetrievedChunk } from './rag/weaviate';
+import {
+  type MessageSource,
+  buildContextBlock,
+  buildSourceFooter,
+  buildSources,
+} from './rag/sources';
 
 const MAX_HISTORY_MESSAGES = 10;
 
@@ -69,34 +77,38 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   if (!content) throw badRequest('Message content must not be empty');
 
   const conversation = await getConversation(input.userId, input.conversationId);
-  const context = await resolveContext(input.userId, conversation.documentId);
   const history = toLLMHistory(conversation.messages);
 
   const userMessage = await prisma.message.create({
     data: { conversationId: conversation.id, role: 'USER', content },
   });
 
+  const { context, chunks } = await buildRetrievalContext(
+    input.userId,
+    conversation.documentId,
+    content,
+  );
+
   const result = await generateAnswer({ question: content, context, history });
 
-  const sources = result.citations.length > 0
-    ? result.citations.map((c) => ({ documentId: conversation.documentId ?? '', snippet: c }))
-    : undefined;
+  const sources = buildSources(chunks);
+  const footer = buildSourceFooter(chunks);
+  const answer = footer ? `${result.answer}\n\n${footer}` : result.answer;
 
   const assistantMessage = await prisma.message.create({
     data: {
       conversationId: conversation.id,
       role: 'ASSISTANT',
-      content: result.answer,
+      content: answer,
       model: result.model,
       promptTokens: result.usage.promptTokens,
       completionTokens: result.usage.completionTokens,
       promptVersionId: result.promptVersion.id,
       confidence: CONFIDENCE_SCORE[result.confidence],
-      sources,
+      sources: sources.length > 0 ? (sources as unknown as object) : undefined,
     },
   });
 
-  // Touch the conversation so list ordering reflects recent activity.
   await prisma.conversation.update({
     where: { id: conversation.id },
     data: { updatedAt: new Date() },
@@ -105,13 +117,36 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   return { userMessage, assistantMessage };
 }
 
-async function resolveContext(
+interface RetrievalContext {
+  context?: string;
+  chunks: RetrievedChunk[];
+}
+
+/**
+ * Retrieves relevant chunks for the question via RAG. If retrieval yields
+ * nothing (no linked document, vector store unavailable, or not yet indexed),
+ * it gracefully falls back to the document's full text so answers still work.
+ */
+async function buildRetrievalContext(
   userId: string,
   documentId: string | null,
-): Promise<string | undefined> {
-  if (!documentId) return undefined;
+  question: string,
+): Promise<RetrievalContext> {
+  if (!documentId) return { chunks: [] };
+
   const document = await documentService.getDocument(userId, documentId);
-  return document.content.slice(0, MAX_CONTEXT_CHARS);
+
+  try {
+    const chunks = await rag.retrieve(documentId, question);
+    if (chunks.length > 0) {
+      return { context: buildContextBlock(chunks), chunks };
+    }
+  } catch (err) {
+    console.error(`RAG retrieval failed for document ${documentId}:`, err);
+  }
+
+  // Fallback: inline (truncated) full document text.
+  return { context: document.content.slice(0, MAX_CONTEXT_CHARS), chunks: [] };
 }
 
 function toLLMHistory(messages?: Message[]): LLMMessage[] {
@@ -124,3 +159,5 @@ function toLLMHistory(messages?: Message[]): LLMMessage[] {
       content: m.content,
     }));
 }
+
+export type { MessageSource };
