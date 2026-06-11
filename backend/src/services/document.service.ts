@@ -1,5 +1,6 @@
 import { prisma } from '../config/prisma';
 import { AppError } from '../lib/errors';
+import * as rag from './rag/rag.service';
 
 export interface CreateDocumentInput {
   ownerId: string;
@@ -22,21 +23,45 @@ export async function getDocument(ownerId: string, id: string) {
   return document;
 }
 
-export function createDocument(input: CreateDocumentInput) {
-  // No async ingestion pipeline yet, so a freshly added document is
-  // immediately queryable. When RAG lands, this becomes PENDING and a
-  // worker flips it to READY after chunking + embedding.
-  return prisma.document.create({
+/**
+ * Creates a document and synchronously ingests it into the vector store
+ * (chunk -> embed -> store). Status reflects the ingestion lifecycle so the
+ * UI can show progress: PROCESSING -> READY, or FAILED if ingestion errors.
+ */
+export async function createDocument(input: CreateDocumentInput) {
+  const document = await prisma.document.create({
     data: {
       ownerId: input.ownerId,
       title: input.title,
       content: input.content,
-      status: 'READY',
+      status: 'PROCESSING',
     },
   });
+
+  try {
+    await rag.ingestDocument({
+      documentId: document.id,
+      ownerId: document.ownerId,
+      title: document.title,
+      content: document.content,
+    });
+    return prisma.document.update({
+      where: { id: document.id },
+      data: { status: 'READY' },
+    });
+  } catch (err) {
+    console.error(`Ingestion failed for document ${document.id}:`, err);
+    // The document is still usable via the full-text fallback in retrieval,
+    // but we surface FAILED so the user knows embedding-based search is off.
+    return prisma.document.update({
+      where: { id: document.id },
+      data: { status: 'FAILED' },
+    });
+  }
 }
 
 export async function deleteDocument(ownerId: string, id: string): Promise<void> {
   await getDocument(ownerId, id);
+  await rag.removeDocument(id);
   await prisma.document.delete({ where: { id } });
 }
