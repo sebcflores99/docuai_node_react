@@ -4,13 +4,14 @@ WORKDIR /app
 
 RUN corepack enable
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml .npmrc ./
 RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json ./
+COPY prisma ./prisma
 COPY src/ ./src/
-# When Prisma is added, also: COPY prisma ./prisma && RUN pnpm prisma generate
 
+RUN pnpm prisma generate
 RUN pnpm run build
 
 # Production stage
@@ -20,9 +21,12 @@ WORKDIR /app
 
 RUN corepack enable
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml .npmrc ./
 RUN pnpm install --prod --frozen-lockfile
 
+# Bring over the generated Prisma client (hoisted layout makes this clean)
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY prisma ./prisma
 COPY --from=builder /app/dist ./dist
 
 EXPOSE 8000

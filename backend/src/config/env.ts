@@ -1,6 +1,11 @@
+import 'dotenv/config';
+
 /**
  * Centralized environment configuration.
  * Reads from process.env with sensible defaults for local/dev.
+ *
+ * Locally (pnpm dev) values come from backend/.env via dotenv.
+ * In Docker they are injected by docker-compose.yml.
  */
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',

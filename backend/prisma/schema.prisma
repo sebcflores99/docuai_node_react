@@ -1,0 +1,97 @@
+// Prisma schema for DocuAI — relational data.
+// Vector embeddings/chunks are stored in Weaviate, not here.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  passwordHash  String
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  documents     Document[]
+  conversations Conversation[]
+}
+
+model Document {
+  id            String         @id @default(uuid())
+  ownerId       String
+  owner         User           @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title         String
+  // Original extracted text. Chunked + embedded into Weaviate for retrieval.
+  content       String
+  status        DocumentStatus @default(PENDING)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  conversations Conversation[]
+
+  @@index([ownerId])
+}
+
+model Conversation {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentId String?
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  title      String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  messages   Message[]
+
+  @@index([userId])
+  @@index([documentId])
+}
+
+model Message {
+  id               String         @id @default(uuid())
+  conversationId   String
+  conversation     Conversation   @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role             MessageRole
+  content          String
+  // Which prompt version produced this (for assistant messages / auditability).
+  promptVersionId  String?
+  promptVersion    PromptVersion? @relation(fields: [promptVersionId], references: [id], onDelete: SetNull)
+  // Model + token metadata for cost tracking and evaluation.
+  model            String?
+  promptTokens     Int?
+  completionTokens Int?
+  createdAt        DateTime       @default(now())
+
+  @@index([conversationId])
+}
+
+// Prompt versioning/configuration — required by the assessment.
+model PromptVersion {
+  id        String    @id @default(uuid())
+  name      String
+  version   Int
+  template  String
+  provider  String    @default("openai")
+  model     String    @default("gpt-4o-mini")
+  isActive  Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  messages  Message[]
+
+  @@unique([name, version])
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
