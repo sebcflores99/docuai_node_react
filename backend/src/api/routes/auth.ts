@@ -6,12 +6,10 @@ import { loginSchema, signupSchema } from '../validators/auth.schema';
 
 const router: Router = Router();
 
-router.post('/signup', validateBody(signupSchema), authController.signup);
+// `register` is the primary name; `signup` is kept as an alias.
+router.post('/register', validateBody(signupSchema), authController.register);
+router.post('/signup', validateBody(signupSchema), authController.register);
 router.post('/login', validateBody(loginSchema), authController.login);
-
-// Returns the currently authenticated user — also serves as a protected-route example.
-router.get('/me', requireAuth, (req, res) => {
-  res.json({ user: req.user });
-});
+router.get('/me', requireAuth, authController.me);
 
 export default router;
