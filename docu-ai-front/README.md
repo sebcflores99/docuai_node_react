@@ -92,7 +92,27 @@ Other scripts:
 ```bash
 pnpm build    # type-check (tsc -b) + production build to dist/
 pnpm lint     # ESLint
+pnpm test     # run the Vitest suite once
+pnpm test:watch  # run Vitest in watch mode
 pnpm preview  # serve the production build locally
+```
+
+## Testing
+
+Unit/component tests use **Vitest** + **React Testing Library** (jsdom). Tests live
+next to the code they cover (`*.test.ts[x]`). Coverage focuses on the logic that
+matters for the AI-aware UX and API integration:
+
+- `api/client` — base URL, JWT header, body serialization, 204 handling, and
+  `ApiError` normalization (including network failures).
+- `components/Confidence` — confidence thresholds and the low-confidence warning.
+- `components/MessageBubble` — user vs. assistant rendering, sources, token
+  metadata, uncertainty notice, and the re-ask action.
+- `components/States`, `ModelStatus`, `DocumentStatusBadge` — loading/error/empty
+  and status indicators.
+
+```bash
+pnpm test
 ```
 
 ## Configuration
