@@ -1,6 +1,6 @@
 # DocuAI — AI-Assisted Document Q&A Application
 
-> A full-stack AI-powered application that enables users to upload documents and interact with an AI assistant to extract insights, answer questions, and retrieve information from their content.
+> A full-stack, AI-powered application where users paste documents and chat with an assistant that answers **using only that document**, grounding every answer in retrieved passages with **file + page citations**.
 
 ## Table of Contents
 
@@ -12,26 +12,27 @@
 - [Security & Secrets Management](#security--secrets-management)
 - [Data Flow & Storage](#data-flow--storage)
 - [Known Limitations & Trade-offs](#known-limitations--trade-offs)
-- [Bonus Implementations](#bonus-implementations)
+- [Infrastructure & Deployment](#infrastructure--deployment)
+- [Bonus & Future Work](#bonus--future-work)
 
 ---
 
 ## Overview
 
-**DocuAI** addresses the challenge of extracting structured insights from unstructured documents. Users can:
+**DocuAI** lets users extract insights from their own documents through conversation. Users can:
 
-1. **Upload documents** (text or files) via a React frontend
-2. **Ask questions** about their content in natural language
-3. **Receive AI-generated answers** with context and confidence signals
-4. **Refine queries** and explore multi-turn conversations
+1. **Add a document** (paste text) via a React frontend
+2. **Ask questions** about its content in natural language
+3. **Receive grounded answers** with a confidence signal and **source citations (file + page)**
+4. **Refine and re-ask** across a multi-turn conversation
 
-### Use Case
+### Runs offline by default
 
-This implementation covers **AI assistant that answers questions about uploaded documents** — suitable for:
-- Customer support document repositories
-- Legal/compliance document analysis
-- Research paper Q&A
-- Knowledge base exploration
+The whole stack runs locally with **no API keys**. The default `LLM_PROVIDER=mock` and `EMBEDDING_PROVIDER=mock` use a deterministic mock model and a deterministic local embedder, so you can demo the complete flow (auth → ingest → RAG retrieval → cited answer) entirely offline. Point the providers at OpenAI/Anthropic to use real models (see [Environment Setup](#environment-setup)).
+
+### Use case
+
+This implements **"AI assistant that answers questions about uploaded documents"** — suitable for support knowledge bases, legal/compliance review, and research-paper Q&A.
 
 ---
 
@@ -41,51 +42,47 @@ This implementation covers **AI assistant that answers questions about uploaded 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                       React Frontend                        │
-│  (Routing, Auth, Document Upload, Chat UI)                 │
-└────────────────────┬────────────────────────────────────────┘
-                     │ HTTPS
-                     │
-┌────────────────────▼────────────────────────────────────────┐
-│              Express.js Backend (Node.js)                   │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ Routes: /health, /auth, /documents, /chat/ask        │   │
-│  │ Middleware: JWT auth, validation, error handling     │   │
-│  └──────────────────────────────────────────────────────┘   │
+│                       React Frontend (Vite)                  │
+│  Login · Documents (Input) · Chat (Results)                  │
+│  Served by nginx, which also proxies /api → backend          │
+└────────────────────────┬─────────────────────────────────────┘
+                         │  /api/*  (same-origin, no CORS)
+┌────────────────────────▼─────────────────────────────────────┐
+│                 Express 5 Backend (Node + TS)                │
+│  Routes: /api/health · /api/auth · /api/documents            │
+│          · /api/conversations                                │
+│  Middleware: JWT auth · zod validation · error handling      │
 │                                                              │
-│  ┌────────────────────────────────────────────────────┐   │
-│  │ AI Layer (LLM Provider Abstraction)                  │   │
-│  │ ├─ Prompt Construction & Template Engine            │   │
-│  │ ├─ Model Invocation (OpenAI / Anthropic)            │   │
-│  │ ├─ Response Parsing & Validation                    │   │
-│  │ └─ Cost & Rate Limiting                             │   │
-│  └────────────────────────────────────────────────────┘   │
+│  AI layer (provider-agnostic):                               │
+│   ├─ Prompt construction (versioned template + context)     │
+│   ├─ Model invocation   (mock | openai | anthropic)         │
+│   └─ Response post-processing (JSON parse → structured)     │
 │                                                              │
-│  ┌────────────────────────────────────────────────────┐   │
-│  │ Vector Store & Retrieval (RAG Layer)                 │   │
-│  │ ├─ Weaviate Vector DB                               │   │
-│  │ ├─ Embedding Generation (text2vec-openai)           │   │
-│  │ └─ Semantic Similarity Search                        │   │
-│  └────────────────────────────────────────────────────┘   │
-└────┬──────────────┬──────────────────────┬─────────────────┘
-     │              │                      │
-┌────▼──┐   ┌──────▼──────┐    ┌──────────▼──────────┐
-│Postgres│   │  Weaviate   │    │  OpenAI / Anthropic │
-│  (DB)  │   │ (Vector DB) │    │   (LLM Provider)    │
-└────────┘   └─────────────┘    └─────────────────────┘
+│  RAG layer:                                                  │
+│   ├─ Chunker (page-aware)                                   │
+│   ├─ Embedder (mock | openai) — vectors computed in-app     │
+│   └─ Retrieval (Weaviate nearVector, scoped per document)   │
+└────┬──────────────────┬───────────────────┬─────────────────┘
+     │                  │                   │
+┌────▼────┐    ┌────────▼────────┐   ┌──────▼───────────────┐
+│ Postgres │    │    Weaviate     │   │ OpenAI / Anthropic   │
+│ (Prisma) │    │ vectorizer:none │   │ (only if configured) │
+└──────────┘    └─────────────────┘   └──────────────────────┘
 ```
+
+Embeddings are **computed by the backend** and stored in Weaviate with `vectorizer: none`. Weaviate therefore needs no vectorizer module or API key, which is what keeps the offline/mock path working.
 
 ### Technology Stack
 
-| Layer       | Technology              | Purpose                                 |
-|-------------|-------------------------|-----------------------------------------|
-| Frontend    | React 18, TypeScript    | User interface & routing                |
-| Backend     | Express.js, Node.js     | API server & business logic             |
-| Database    | PostgreSQL 16           | Structured data (users, documents)      |
-| Vector DB   | Weaviate 1.24.6         | Semantic search & embeddings            |
-| LLM         | OpenAI API              | AI model for Q&A & analysis             |
-| Container   | Docker & Docker Compose | Local development & deployment          |
-| ORM         | Prisma 6.1              | Type-safe database access               |
+| Layer       | Technology                       | Purpose                                   |
+|-------------|----------------------------------|-------------------------------------------|
+| Frontend    | React 19, TypeScript, Vite       | UI & routing; nginx serves + proxies /api |
+| Backend     | Express 5, Node 20, TypeScript   | REST API & business logic                 |
+| Database    | PostgreSQL 16 + Prisma 6         | Users, documents, conversations, messages |
+| Vector DB   | Weaviate 1.24.6 (`vectorizer:none`) | Semantic search over document chunks   |
+| LLM         | mock (default) · OpenAI · Anthropic | Pluggable provider via `LLM_PROVIDER`  |
+| Embeddings  | mock (default) · OpenAI          | Pluggable via `EMBEDDING_PROVIDER`        |
+| Container   | Docker & Docker Compose          | One-command local stack                   |
 
 ---
 
@@ -93,461 +90,332 @@ This implementation covers **AI assistant that answers questions about uploaded 
 
 ### Prerequisites
 
-- **Docker** & **Docker Compose** (for containerized setup)
-- **Node.js 18+** & **pnpm** (for local development without Docker)
-- **OpenAI API Key** (or compatible LLM provider)
+- **Docker** & **Docker Compose** (for the containerized stack)
+- For local dev without Docker: **Node 20+** and **pnpm 10** (`corepack enable`)
+- **No API keys required** for the default mock providers
 
 ### Quick Start (with Docker)
 
-1. **Clone & navigate to repo**
-   ```bash
-   cd FS_AI_ENG_Assessment
-   ```
+```bash
+make up-d      # generates .env (mock providers), builds, starts everything
+# open http://localhost:3000  → sign up → add a document → ask questions
+make logs      # follow logs
+make down      # stop containers   (make clean = also wipe volumes)
+```
 
-2. **Create `.env` from template**
-   ```bash
-   cp .env.example .env
-   # Edit .env and add your real OPENAI_API_KEY and JWT_SECRET
-   ```
+`make up-d` runs `make setup` first, which creates a demo `.env` (mock LLM + mock embeddings + a random `JWT_SECRET`) if one doesn't exist. Migrations are applied automatically on backend startup.
 
-3. **Start services**
-   ```bash
-   make up-d    # Start in background
-   make logs    # View logs
-   ```
-
-4. **Verify services**
-   ```bash
-   make ps
-   # Backend: http://localhost:8000/health
-   # Frontend: http://localhost:3000
-   # Weaviate: http://localhost:8080
-   ```
-
-5. **Stop services**
-   ```bash
-   make down
-   ```
+Service URLs:
+- Frontend: http://localhost:3000
+- Backend health: http://localhost:8000/api/health
+- Weaviate ready: http://localhost:8080/v1/.well-known/ready
 
 ### Local Development (without Docker)
 
-#### Backend Setup
+You'll need Postgres and Weaviate running (e.g. `docker compose up -d postgres weaviate`).
 
 ```bash
+# Backend
 cd backend
 pnpm install
+cp .env.example .env        # then edit values
+pnpm prisma:migrate         # apply migrations (prisma migrate dev)
+pnpm dev                    # http://localhost:8000
 
-# Create .env from template
-cp .env.example .env
-
-# Run migrations
-pnpm prisma:migrate
-
-# Start dev server
-pnpm dev  # Runs on http://localhost:8000
-```
-
-#### Frontend Setup
-
-```bash
+# Frontend (separate terminal)
 cd docu-ai-front
 pnpm install
-pnpm dev  # Runs on http://localhost:3000
+pnpm dev                    # http://localhost:5173 (Vite dev server)
 ```
+
+For local dev the frontend reads `VITE_API_URL` (defaults to `http://localhost:8000/api`).
 
 ### Environment Setup
 
-Create `.env` file from `.env.example`:
+The Docker stack reads a single root `.env`. `make setup` generates one for mock mode; to use real models, set the keys and switch providers:
 
 ```env
-# OpenAI API Key — used by backend & Weaviate text2vec-openai
-OPENAI_API_KEY=sk-...
+# Leave blank for offline mock mode
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
 
-# JWT signing secret — generate with:
-#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-JWT_SECRET=your-secret-here
+# Auth
+JWT_SECRET=<32-byte hex>        # make setup generates this
+JWT_EXPIRES_IN=7d
 
-# LLM provider (openai | anthropic)
-LLM_PROVIDER=openai
+# Providers: mock (no key) | openai | anthropic
+LLM_PROVIDER=mock
+# Embeddings: mock (no key) | openai  (auto-selects openai when OPENAI_API_KEY is set)
+EMBEDDING_PROVIDER=mock
+# EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-**For local backend dev**, copy `.env` to `backend/.env`:
-```bash
-cp .env backend/.env
-```
+> Switching embedders changes vector dimensionality (mock = 256, OpenAI `text-embedding-3-small` = 1536). **Re-ingest documents after switching**, or run `make clean` to reset the vector store.
 
 ---
 
 ## API Documentation
 
+Base path: **`/api`**. In Docker the frontend calls it same-origin via the nginx proxy; directly it's `http://localhost:8000/api`.
+
 ### Authentication
 
-All endpoints (except `/health`) require JWT:
+All routes except `/api/health*` and `/api/auth/*` require a Bearer token:
 
 ```http
 Authorization: Bearer <JWT_TOKEN>
 ```
 
-### Endpoints
+Errors use a flat shape: `{ "message": string, "code": string }`.
 
-#### Health Check
+### Health
+
 ```http
-GET /health
+GET /api/health        → { "status": "ok", "service": "docu-ai-backend", "timestamp": "..." }
+GET /api/health/db     → { "status": "ok", "database": "connected" }
 ```
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-06-11T01:00:00.000Z",
-  "version": "1.0.0"
-}
-```
+### Auth
 
-#### Login
 ```http
-POST /auth/login
-Content-Type: application/json
-
-{
-  "email": "user@example.com",
-  "password": "secure-password"
-}
+POST /api/auth/register      # alias: POST /api/auth/signup
+POST /api/auth/login
+GET  /api/auth/me            # requires auth
 ```
+
+`register` / `login` body: `{ "email": "...", "password": "..." }` (password ≥ 8 chars).
 
 **Response:**
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
-  "user": {"id": "user-123", "email": "user@example.com"}
+  "user": { "id": "uuid", "email": "user@example.com", "createdAt": "2026-06-11T07:16:36.297Z" }
 }
 ```
 
-#### Ask Question About Document
+### Documents
+
 ```http
-POST /chat/ask
-Authorization: Bearer <JWT_TOKEN>
-Content-Type: application/json
-
-{
-  "documentId": "doc-123",
-  "question": "What are the key findings?",
-  "context": "previous-message-id"
-}
+GET    /api/documents          # list own documents
+POST   /api/documents          # { "title": "...", "content": "..." }
+GET    /api/documents/:id
+DELETE /api/documents/:id      # 204; also removes vector chunks
 ```
 
-**Response:**
+On create, the document is chunked, embedded, and stored; its `status` moves `PROCESSING → READY` (or `FAILED` if ingestion errors, in which case retrieval falls back to full text).
+
+### Conversations & Messages
+
+```http
+GET  /api/conversations?documentId=<id>     # list (optionally filtered)
+POST /api/conversations                     # { "documentId": "...", "title?": "..." }
+GET  /api/conversations/:id                 # conversation + messages[]
+POST /api/conversations/:id/messages        # { "content": "your question" }
+```
+
+**`POST /:id/messages` response** — persists the user turn and the grounded assistant turn:
 ```json
 {
-  "messageId": "msg-456",
-  "answer": "Based on the document...",
-  "confidence": 0.92,
-  "sources": [{"documentId": "doc-123", "excerpt": "...", "score": 0.95}],
-  "status": "completed",
-  "processingTime": 1250
+  "userMessage": { "id": "uuid", "role": "USER", "content": "When was the Eiffel Tower completed?", "createdAt": "..." },
+  "assistantMessage": {
+    "id": "uuid",
+    "role": "ASSISTANT",
+    "content": "...answer...\n\nSources: France Facts (p. 1)",
+    "confidence": 0.65,
+    "model": "mock-model",
+    "promptTokens": 210,
+    "completionTokens": 45,
+    "sources": [
+      { "documentId": "uuid", "documentTitle": "France Facts", "page": "1", "snippet": "Paris is the capital...", "score": 0.91 }
+    ],
+    "createdAt": "..."
+  }
 }
 ```
+
+`confidence` is normalized to `0..1` (low/medium/high → 0.3/0.65/0.9). `sources` are derived from the **actually retrieved chunks**, and the answer text gets an appended `Sources: <file> (pp. X–Y)` footer.
 
 ---
 
 ## AI Design & Implementation
 
-### LLM Provider Abstraction
+### Clear separation of concerns
 
-Abstracts LLM provider details to enable:
-- Easy switching between OpenAI, Anthropic, etc.
-- Testing with mocked providers
-- Cost control and rate limiting per provider
-- Prompt versioning independent of model changes
+The AI pipeline is split into three independently testable stages (per the assessment):
+
+- **Prompt construction** — `services/ai/promptBuilder.ts` wraps the question and retrieved context in explicit `<context>` / `<question>` delimiters using the active prompt template.
+- **Model invocation** — `services/ai/providers/*` implement a single `LLMProvider` interface; the rest of the app never imports a vendor SDK directly.
+- **Response post-processing** — `services/ai/postProcess.ts` defensively parses the model output into `{ answer, confidence, citations }` (strips code fences, extracts the JSON object, falls back to low-confidence prose).
+
+### LLM provider abstraction
 
 ```typescript
 interface LLMProvider {
-  invoke(prompt: string, options: InvokeOptions): Promise<LLMResponse>;
-  getName(): string;
-  supportsStreaming(): boolean;
+  readonly name: string;                                   // "mock" | "openai" | "anthropic"
+  complete(req: LLMCompletionRequest): Promise<LLMCompletionResult>;
 }
 ```
 
-### Prompt Construction & Safety
+A factory (`services/ai/providers/index.ts`) selects the implementation from `LLM_PROVIDER` and caches it. Adding a provider means implementing the interface and registering it — no call-site changes.
 
-**Injection Prevention:**
-1. Input validation — strip/escape special characters before embedding
-2. Parametric queries — structured format specs instead of concatenation
-3. Length limits — cap question/context to prevent token abuse
-4. Schema enforcement — validate LLM responses against expected JSON
+### Prompt versioning
 
-### Cost & Rate Limiting
+The active system prompt lives in the `PromptVersion` table (name, version, template, provider, model, isActive). It self-bootstraps a `document-qa` v1 on first use, and every assistant message links to the `promptVersionId` that produced it for auditability and A/B comparison.
 
-```typescript
-class RateLimiter {
-  private tokenBudget = {
-    openai: 1_000_000 / 30,       // ~33k tokens/day
-    anthropic: 100_000_000 / 30   // ~3.3M tokens/day
-  };
+### Prompt-injection & unsafe input
 
-  async checkLimit(provider: string, tokens: number): Promise<void> {
-    const remaining = await this.getRemaining(provider);
-    if (remaining < tokens) {
-      throw new Error(`Rate limit exceeded`);
-    }
-  }
-}
-```
+1. **Validation** — zod schemas cap question/content/context length and reject malformed bodies.
+2. **Control-char sanitization** — stripped from user input before it reaches the model.
+3. **Delimited, data-not-instructions framing** — the system prompt instructs the model to treat `<context>`/`<question>` strictly as data and never to follow instructions found inside them.
+4. **Schema-enforced output** — responses are validated/normalized, never `eval`'d.
+5. **Body size limit** — `express.json({ limit: '1mb' })`.
 
-### Vector Search Integration (RAG)
+### RAG flow
 
-**Flow:**
-1. User uploads document → extract text & generate embeddings
-2. Embeddings stored in Weaviate with metadata
-3. User asks question → generate embedding for question
-4. Semantic search retrieves top-K similar passages
-5. Pass context to LLM for grounded answer
+1. On upload, text is **chunked** (≈1000 chars, 150 overlap) with **page tracking** — synthetic ~1800-char pages, or real form-feed (`\f`) breaks when present.
+2. Each chunk is **embedded in the backend** and stored in Weaviate with `{documentId, ownerId, title, chunkIndex, pageStart, pageEnd}`.
+3. A question is embedded and matched via `nearVector`, **scoped to the document** (top-K = 4).
+4. Retrieved chunks become the labeled context block; sources + page footer are derived from them.
 
-**Chunking:** 500-token chunks with 100-token overlap
+If retrieval fails or returns nothing (vector store down, not yet indexed), it **gracefully falls back** to the document's full text so answers still work.
 
-### Handling Hallucinations
+### Cost & rate limiting (strategy)
 
-1. **Confidence scoring** — track LLM deviation from retrieved context
-2. **Citation enforcement** — require sources for factual claims
-3. **Fallback retrieval** — return top passages if confidence < threshold
-4. **Explicit uncertainty** — LLM trained to say "I don't know"
+> Not implemented in code beyond the request body-size cap — documented here as the production approach.
+
+- **Per-user/IP request limits** at the edge or via middleware (e.g. `express-rate-limit` + Redis).
+- **Token budgeting** per provider with pre-flight estimation and hard caps.
+- **Caching** identical (document, question) pairs; **batching** embeddings.
+- **Cheaper default models** (e.g. `gpt-4o-mini`) with escalation only when needed.
+
+### Handling hallucinations / uncertainty
+
+- System prompt: answer **only** from context, else say so → low confidence.
+- Confidence surfaced numerically; the UI shows a warning + nudge to verify when low.
+- Truthful **citations** drawn from retrieved chunks (not model self-report), shown with file + page.
 
 ---
 
 ## Security & Secrets Management
 
-### Secrets Approach
+### Secrets approach
 
-**Single `.env` file for the entire stack:**
+A single root **`.env`** (gitignored) holds shared secrets and is injected by Docker Compose. `*.env.example` files are committed as templates; `make setup` generates a working `.env` for local demos.
 
 ```
-.env              ← Shared secrets (never committed, in .gitignore)
-                    Contains: OPENAI_API_KEY, JWT_SECRET
-                    Loaded by: backend, weaviate
+.env            ← OPENAI_API_KEY, ANTHROPIC_API_KEY, JWT_SECRET, provider switches
+                  (never committed; in .gitignore)
 ```
 
-**Why simple is better:**
-- ✅ Single source of truth
-- ✅ Easy rotation (update `.env`, restart services)
-- ✅ No duplication across multiple env files
-- ✅ Postgres credentials stay inline (not sensitive in dev)
+Postgres uses inline non-sensitive dev defaults in `docker-compose.yml`. Weaviate needs no secret (vectorizer none).
 
-### Docker Compose Integration
+### JWT implementation
 
-```yaml
-backend:
-  env_file:
-    - .env          # Loads OPENAI_API_KEY, JWT_SECRET
+- **Algorithm**: HS256 · **Secret**: 256-bit hex · **Lifetime**: `JWT_EXPIRES_IN` (default 7d)
+- Stateless Bearer tokens; passwords hashed with **bcrypt** (cost 12)
+- Login uses a constant-time dummy compare to avoid user-enumeration
 
-weaviate:
-  env_file:
-    - .env          # Loads OPENAI_APIKEY for text2vec-openai
+### API key rotation (production)
 
-postgres:
-  environment:
-    POSTGRES_USER: postgres           # Dev defaults
-    POSTGRES_PASSWORD: postgres       # (inline, not sensitive)
-    POSTGRES_DB: docuai
+```
+1. Create the new key in the provider dashboard
+2. Update the secret (.env locally; Secrets Manager in prod)
+3. Roll the service (make restart / new task revision)
+4. Verify, then revoke the old key
 ```
 
-### JWT Implementation
-
-- **Secret**: 256-bit random hex
-- **Algorithm**: HS256
-- **Expiration**: 7 days
-- **Rotation**: Via `/auth/refresh` endpoint
-
-### API Key Rotation (Production)
-
-```bash
-1. Generate new key in OpenAI dashboard
-2. Update .env with new key
-3. Redeploy: make restart
-4. Monitor logs for successful auth
-5. Delete old key
-```
+In production these keys would live in **AWS Secrets Manager / SSM**, not a file (see [Infrastructure](#infrastructure--deployment)).
 
 ---
 
 ## Data Flow & Storage
 
-### Data Retention Policy
+### What we store vs. don't
 
-| Data Type          | Storage   | Retention | Rationale                  |
-|--------------------|-----------|-----------|----------------------------|
-| User Credentials   | Postgres  | Until deletion | Must persist securely   |
-| Documents          | Postgres  | Until deletion | User-owned content      |
-| AI Embeddings      | Weaviate  | Until deletion | Required for search     |
-| Conversation       | Postgres  | 90 days   | Audit trail & UX context   |
-| API Logs           | App       | 30 days   | Debugging, no PII stored   |
-| OpenAI Responses   | Postgres  | 90 days   | Quality evaluation      |
+| Data              | Store    | Notes                                                        |
+|-------------------|----------|--------------------------------------------------------------|
+| User credentials  | Postgres | email + **bcrypt** hash (never plaintext)                    |
+| Documents         | Postgres | user-owned text content                                      |
+| Document chunks   | Weaviate | text + embedding vector + page metadata                      |
+| Conversations/Messages | Postgres | includes model, token counts, confidence, sources      |
+| API keys          | —        | env/secret store only; never persisted in the DB            |
 
-### PII Handling
+### Retention & PII (policy)
 
-**Safeguards:**
-1. Database encryption for sensitive fields
-2. No PII in application logs
-3. Data anonymization for AI training
-4. Hard delete all user data on account termination
+- Hard-delete a document → its Postgres row **and** its Weaviate chunks are removed.
+- Account deletion would cascade user data (FKs use `onDelete: Cascade`).
+- Avoid logging PII; mask unexpected errors as generic 500s.
+- Production: encrypt at rest (RDS/KMS), define explicit retention windows for conversations and logs.
 
-### Document Processing
-
-```
-Upload → Scan → Extract → Chunk → Embed → Store → Ready
-```
+See **`docs/PART2_AI_DATA_AND_ARCHITECTURE.md`** for the full Part 2 write-up (evaluation, regression detection, wrong-answer handling).
 
 ---
 
 ## Known Limitations & Trade-offs
 
-### Architecture Trade-offs
+| Decision               | Trade-off                              | Mitigation / future                          |
+|------------------------|----------------------------------------|----------------------------------------------|
+| Mock providers default | Mock embeddings are lexical, not semantic | Set `*_PROVIDER=openai` for real retrieval |
+| Synchronous ingestion  | Large docs block the create request    | Move to a queue/worker (status already modeled) |
+| Synchronous LLM calls  | Request blocks during model latency     | Streaming + async queue                      |
+| Single backend instance| No horizontal scaling                   | Stateless JWT already enables scaling out    |
+| Stateless JWT          | Can't revoke a token before expiry      | Short TTL; Redis blacklist in prod           |
+| Char-offset "pages"    | Synthetic for pasted text               | Real page extraction when PDF upload is added |
 
-| Decision           | Trade-off                        | Mitigation                            |
-|--------------------|---------------------------------|---------------------------------------|
-| Single Backend     | No horizontal scaling            | Add load balancing + multiple instances |
-| Sync LLM Calls     | Blocks during latency (5-20s)    | Async via Bull queues in production   |
-| Vector DB Local    | Single point of failure          | Use managed Weaviate Cloud in prod    |
-| Stateless JWT      | Can't revoke immediately         | Redis token blacklist for production  |
-
-### AI Limitations
-
-1. **Hallucinations** — LLM may fabricate facts
-   - Mitigation: Citations, confidence scoring, source display
-
-2. **Context Window** — Large documents exceed token limits
-   - Mitigation: Chunking, summarization, multi-hop retrieval
-
-3. **Semantic Gaps** — Embeddings miss nuanced relationships
-   - Mitigation: Hybrid search (keyword + semantic), human feedback
-
-4. **Cost at Scale** — API costs scale with usage
-   - Mitigation: Caching, batching, cheaper models, self-hosted inference
-
----
-
-## Bonus Implementations
-
-### Vector Store (Implemented ✅)
-- Weaviate 1.24.6
-- OpenAI embeddings (1536 dimensions)
-- Semantic similarity search
-- 500-token chunks with 100-token overlap
-
-### Async Processing (Ready)
-```typescript
-const queue = new Queue('document-processing');
-queue.process(async (job) => {
-  // Generate embeddings, store, notify frontend
-});
-```
-
-### Streaming Responses (Ready)
-```typescript
-app.get('/chat/ask-stream', (res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  // Stream tokens as they arrive
-});
-```
-
-### Cost Estimation
-
-| Metric | 1k Requests | 10k Requests | 100k Requests |
-|--------|-------------|--------------|---------------|
-| OpenAI | $2-5 | $20-50 | $200-500 |
-| Weaviate | $0 | $0 | $0 |
-| Postgres | $10/mo | $25/mo | $50/mo |
-| **Total** | ~$15 | ~$50 | ~$300 |
+**AI limitations:** hallucinations (mitigated via citations + confidence), context-window limits (mitigated via chunking/retrieval), and cost at scale (caching/batching/cheaper models).
 
 ---
 
 ## Infrastructure & Deployment
 
-### AWS Strategy
+> Local-first for this assessment (`make up-d`). The AWS design below is the intended production target, not provisioned here.
 
 ```yaml
 Compute:
-  - ECS Fargate (serverless, auto-scaling)
-  - CloudFront CDN for frontend
-  - RDS Postgres managed
-
-AI:
-  - Weaviate Cloud managed service
-  - OpenAI API
-
+  - ECS Fargate for backend (auto-scaling), CloudFront + S3 for the frontend
+Data:
+  - RDS Postgres (managed), Weaviate Cloud or self-managed on ECS/EKS
 Secrets:
-  - AWS Secrets Manager for API keys
-  - IAM roles for authentication
-
+  - AWS Secrets Manager / SSM for API keys + JWT secret; IAM task roles
 IaC:
-  - Terraform modules
-  - Separate tfvars for dev/staging/prod
+  - Terraform modules, per-env tfvars (dev/staging/prod)
 ```
 
-### Scaling AI Workloads
-
-1. **LLM rate limits** — Implement request queue
-2. **Embedding generation** — Batch & cache
-3. **Vector DB indexing** — Manage refresh latency
-4. **Database connections** — Connection pooling
+**Scaling AI workloads:** queue + rate-limit LLM calls, batch & cache embeddings, pool DB connections, and isolate bursty inference behind async workers so the API stays responsive.
 
 ---
 
-## Development
+## Bonus & Future Work
 
-### Code Structure
+- **Vector store + RAG (implemented ✅)** — Weaviate, backend-computed embeddings, page-aware citations, graceful fallback.
+- **Provider abstraction + prompt versioning (implemented ✅)**.
+- **Async processing (planned)** — document `status` lifecycle is already modeled (`PROCESSING/READY/FAILED`); move ingestion to a Bull/SQS worker.
+- **Streaming responses (planned)** — token-by-token SSE for the chat endpoint.
+- **Rate limiting (planned)** — see strategy above.
+- **Automated tests (planned)** — pure logic (chunker pages, source footer, post-processing) is structured to be unit-testable.
 
-```
-backend/
-├── src/
-│   ├── api/routes/
-│   ├── services/{llm,rag,auth}/
-│   ├── config/{env,prisma}/
-│   └── index.ts
-├── prisma/{schema,migrations}/
-└── Dockerfile
+### Indicative cost (real OpenAI; mock = $0)
 
-frontend/
-├── src/{pages,components,services,hooks}/
-└── Dockerfile
-```
-
-### Workflow
-
-1. Create branch: `git checkout -b feature/my-feature`
-2. Implement & test locally
-3. Commit: `git commit -m "feat: description"`
-4. Push & open PR
+| Requests | LLM (gpt-4o-mini + embeddings) | Notes                    |
+|----------|--------------------------------|--------------------------|
+| 1k       | ~$1–5                          | depends on doc/answer size |
+| 10k      | ~$15–50                        | add caching to reduce    |
+| 100k     | ~$150–500                      | batch + cache + cheaper models |
 
 ---
 
 ## Troubleshooting
 
-### Backend fails to start
-- Check `.env` has valid `OPENAI_API_KEY`
-- Verify Postgres running: `make ps`
-- Check logs: `make logs-backend`
+**Backend won't start** — `make logs-backend`; ensure Postgres/Weaviate are healthy (`make ps`). Migrations run on startup.
 
-### Frontend can't reach backend
-- Verify backend on `localhost:8000`: `make ps`
-- Check CORS config
-- Clear browser cache (Ctrl+Shift+R)
+**Frontend can't reach backend** — in Docker the SPA uses the nginx `/api` proxy (no CORS). Confirm all containers are up; hard-refresh the browser.
 
-### Weaviate connection fails
-- Verify healthy: `make ps`
-- Check `.env` has `OPENAI_APIKEY`
-- Check logs: `make logs-weaviate`
+**Weaviate issues** — `make logs-weaviate`; it uses `vectorizer: none` and needs no API key.
 
-### Out of memory
-- Reduce chunk size
-- Limit concurrent embeddings to 3-5
-- Use managed Weaviate Cloud
+**Switched providers but retrieval looks off** — re-ingest documents (vector dimensions differ) or `make clean` to reset.
 
 ---
 
 ## License
 
-ISC — See LICENSE file.
-
----
-
-**Questions?** See `docs/Full_Stack_AI_Engineer_Assessment\ \(1\).md`.
+ISC — see LICENSE.
