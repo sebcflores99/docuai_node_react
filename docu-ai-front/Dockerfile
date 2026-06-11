@@ -7,6 +7,11 @@ RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
+# Same-origin API base: nginx proxies /api to the backend, so the SPA calls
+# /api/... and avoids CORS. Overridable at build time.
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
+
 COPY . .
 RUN pnpm run build
 

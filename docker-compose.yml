@@ -8,7 +8,7 @@ services:
     env_file:
       - .env
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=production
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/docuai
       - WEAVIATE_URL=http://weaviate:8080
     depends_on:
@@ -16,9 +16,6 @@ services:
         condition: service_healthy
       weaviate:
         condition: service_healthy
-    volumes:
-      # Hot reload in dev
-      - ./backend/src:/app/src
     networks:
       - docu-ai-network
     restart: unless-stopped
@@ -27,6 +24,9 @@ services:
     build:
       context: ./docu-ai-front
       dockerfile: Dockerfile
+      args:
+        # SPA calls /api (same-origin); nginx proxies it to the backend.
+        VITE_API_URL: /api
     ports:
       - "3000:80"
     depends_on:
@@ -56,8 +56,6 @@ services:
 
   weaviate:
     image: semitechnologies/weaviate:1.24.6
-    env_file:
-      - .env
     ports:
       - "8080:8080"
       - "50051:50051"
@@ -65,8 +63,10 @@ services:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
-      DEFAULT_VECTORIZER_MODULE: text2vec-openai
-      ENABLE_MODULES: text2vec-openai
+      # The backend computes embeddings itself and stores vectors directly,
+      # so Weaviate needs no vectorizer module (works fully offline / no key).
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
       CLUSTER_HOSTNAME: node1
     volumes:
       - weaviate_data:/var/lib/weaviate
