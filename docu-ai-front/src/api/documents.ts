@@ -9,11 +9,16 @@ export function getDocument(id: string): Promise<Document> {
   return apiRequest<Document>(`/documents/${id}`);
 }
 
-export function createDocument(title: string, content: string): Promise<Document> {
-  return apiRequest<Document>('/documents', {
-    method: 'POST',
-    body: { title, content },
-  });
+/**
+ * Uploads a document file. The backend extracts text, chunks, embeds, and
+ * indexes it asynchronously — the returned document starts as PROCESSING and
+ * transitions to READY (poll via getDocument).
+ */
+export function uploadDocument(file: File, title?: string): Promise<Document> {
+  const form = new FormData();
+  form.append('file', file);
+  if (title?.trim()) form.append('title', title.trim());
+  return apiRequest<Document>('/documents', { method: 'POST', body: form });
 }
 
 export function deleteDocument(id: string): Promise<void> {

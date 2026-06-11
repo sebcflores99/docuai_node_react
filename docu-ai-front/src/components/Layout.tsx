@@ -1,4 +1,4 @@
-import { Link, Outlet, useNavigate } from 'react-router-dom';
+import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/useAuth';
 
 export function Layout() {
@@ -20,7 +20,12 @@ export function Layout() {
         <nav className="app-nav">
           {user && (
             <>
-              <Link to="/documents">Documents</Link>
+              <NavLink to="/chat" className="nav-link">
+                Chat
+              </NavLink>
+              <NavLink to="/documents" className="nav-link">
+                Documents
+              </NavLink>
               <span className="user-email" title={user.email}>
                 {user.email}
               </span>

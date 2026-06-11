@@ -71,6 +71,16 @@ describe('apiRequest', () => {
     );
   });
 
+  it('sends FormData as-is without a JSON content-type', async () => {
+    const fetchFn = mockFetch({ jsonBody: {} });
+    const form = new FormData();
+    form.append('file', new File(['x'], 'a.txt', { type: 'text/plain' }));
+    await apiRequest('/documents', { method: 'POST', body: form });
+    const init = fetchFn.mock.calls[0][1]!;
+    expect(init.body).toBeInstanceOf(FormData);
+    expect((init.headers as Record<string, string>)['Content-Type']).toBeUndefined();
+  });
+
   it('returns undefined for 204 responses', async () => {
     mockFetch({ status: 204, headers: new Headers() });
     const result = await apiRequest('/things/1', { method: 'DELETE' });
