@@ -128,7 +128,7 @@ JWT_EXPIRES_IN=7d
 
 # Providers: mock (no key) | openai | anthropic
 LLM_PROVIDER=mock
-# Embeddings: mock (no key) | openai  (auto-selects openai when OPENAI_API_KEY is set)
+# Embeddings: mock (no key) | openai  (keep explicit so offline never calls OpenAI)
 EMBEDDING_PROVIDER=mock
 # EMBEDDING_MODEL=text-embedding-3-small
 ```
