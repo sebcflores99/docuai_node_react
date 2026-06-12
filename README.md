@@ -1,6 +1,6 @@
 # DocuAI — AI-Assisted Document Q&A Application
 
-> A full-stack, AI-powered application where users paste documents and chat with an assistant that answers **using only that document**, grounding every answer in retrieved passages with **file + page citations**.
+> A full-stack, AI-powered application where users paste documents and chat with an assistant that answers **using only that document**, grounding every answer in retrieved passages with **file + page citations**. Agentic - AI First development, using Claude Opus 4.8 in VsCode Copilot.
 
 ## Table of Contents
 
