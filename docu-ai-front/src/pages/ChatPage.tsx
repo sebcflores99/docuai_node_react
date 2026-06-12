@@ -179,11 +179,7 @@ export function ChatPage() {
         )}
 
         {messages.map((m) => (
-          <MessageBubble
-            key={m.id}
-            message={m}
-            onReask={phase !== 'thinking' ? (c) => void send(c) : undefined}
-          />
+          <MessageBubble key={m.id} message={m} />
         ))}
 
         <ModelStatus phase={phase} />

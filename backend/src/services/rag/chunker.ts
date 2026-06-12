@@ -84,10 +84,25 @@ function makeChunk(
   };
 }
 
-/** Splits on paragraph boundaries, keeping the delimiters so offsets line up. */
+/**
+ * Splits on paragraph boundaries (keeping delimiters so offsets line up), then
+ * hard-splits any oversized piece. Without the hard split, a page/paragraph
+ * with no blank lines (common in extracted PDFs) would become one giant chunk
+ * that can exceed the embedding model's token limit.
+ */
 function splitIntoSegments(text: string): string[] {
-  const segments = text.split(/(\n{2,})/);
-  return segments.filter((s) => s.length > 0);
+  const segments = text.split(/(\n{2,})/).filter((s) => s.length > 0);
+  const out: string[] = [];
+  for (const segment of segments) {
+    if (segment.length <= CHUNK_SIZE_CHARS) {
+      out.push(segment);
+      continue;
+    }
+    for (let i = 0; i < segment.length; i += CHUNK_SIZE_CHARS) {
+      out.push(segment.slice(i, i + CHUNK_SIZE_CHARS));
+    }
+  }
+  return out;
 }
 
 /**

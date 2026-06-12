@@ -864,41 +864,65 @@ textarea[aria-invalid='true'] {
 
 /* ── Message bubbles ─────────────────────────────────── */
 .message {
+  display: flex;
+  gap: 12px;
+  max-width: 88%;
+  align-self: flex-start;
+}
+.message-avatar {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 2px;
+}
+.message-assistant .message-avatar {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.message-user .message-avatar {
+  background: var(--text-h);
+  color: var(--surface);
+}
+.message-content {
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 14px 18px;
-  max-width: 85%;
+  padding: 10px 16px 12px;
   background: var(--surface);
   box-shadow: var(--shadow);
 }
 .message-user {
   align-self: flex-end;
+  flex-direction: row-reverse;
+}
+.message-user .message-content {
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
   border-color: transparent;
-  color: #fff;
   border-bottom-right-radius: 6px;
 }
 .message-user .message-role,
 .message-user .message-body {
   color: #fff;
 }
-.message-assistant {
-  align-self: flex-start;
+.message-user .message-role {
+  opacity: 0.85;
+}
+.message-assistant .message-content {
   border-bottom-left-radius: 6px;
 }
-.message-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 6px;
-}
 .message-role {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-h);
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
 }
 .message-body {
   color: var(--text-h);
@@ -912,6 +936,10 @@ textarea[aria-invalid='true'] {
 .message-sources summary {
   cursor: pointer;
   color: var(--accent);
+}
+.message-user .message-sources summary {
+  color: #fff;
+  opacity: 0.9;
 }
 .message-sources ul {
   margin: 8px 0 0;
@@ -929,16 +957,6 @@ textarea[aria-invalid='true'] {
 .source-page {
   color: var(--muted);
   font-size: 12px;
-}
-.message-meta {
-  margin-top: 10px;
-  display: flex;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--text);
-}
-.reask {
-  margin-top: 8px;
 }
 
 /* ── Model status ────────────────────────────────────── */
