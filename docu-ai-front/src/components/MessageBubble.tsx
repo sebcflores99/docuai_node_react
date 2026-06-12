@@ -1,8 +1,7 @@
 import type { Message } from '../types';
-import { ConfidenceBadge, UncertaintyNotice } from './Confidence';
 
 // Renders a single chat message. Assistant messages also show grounding
-// sources, confidence, model + token metadata, and a re-ask affordance.
+// sources, model + token metadata, and a re-ask affordance.
 export function MessageBubble({
   message,
   onReask,
@@ -12,22 +11,14 @@ export function MessageBubble({
 }) {
   const isUser = message.role === 'USER';
   const isAssistant = message.role === 'ASSISTANT';
-  const hasConfidence = typeof message.confidence === 'number';
 
   return (
     <article className={`message message-${message.role.toLowerCase()}`}>
       <header className="message-head">
         <span className="message-role">{isUser ? 'You' : 'Assistant'}</span>
-        {isAssistant && hasConfidence && (
-          <ConfidenceBadge confidence={message.confidence as number} />
-        )}
       </header>
 
       <div className="message-body">{message.content}</div>
-
-      {isAssistant && hasConfidence && (
-        <UncertaintyNotice confidence={message.confidence as number} />
-      )}
 
       {isAssistant && message.sources && message.sources.length > 0 && (
         <details className="message-sources">

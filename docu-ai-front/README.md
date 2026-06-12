@@ -2,8 +2,8 @@
 
 React + TypeScript + Vite frontend for **DocuAI**, an AI assistant that answers
 questions about uploaded documents. Users sign in, add documents, and chat with an
-assistant that answers from those documents while surfacing its sources, confidence,
-and live status.
+assistant that answers from those documents while surfacing its sources and live
+status.
 
 ## Tech stack
 
@@ -29,11 +29,9 @@ All routes except `/login` are protected and redirect unauthenticated users.
   error state if the call fails.
 - **Refine / re‑ask** — every user question has a ↻ Re‑ask action; the input also
   lets users rephrase and ask follow‑ups.
-- **Uncertainty handling** — assistant answers show a confidence badge
-  (high/medium/low). Low‑confidence answers display a warning prompting the user to
-  verify against the source.
-- **Grounding sources** — answers list the document passages they relied on (with
-  page), plus model and token metadata.
+- **Grounded, honest answers** — answers list the document passages they relied on
+  (file + page) so users can verify each claim. When nothing relevant is found, the
+  assistant says so instead of guessing (no fabricated confidence score).
 - **Document processing feedback** — uploads show a progress bar and a status badge
   (Processing → Ready / Failed).
 - **Loading / error / empty states** — consistent primitives across every page.
@@ -54,8 +52,9 @@ src/
     documents.ts     # list / get / upload (multipart) / delete
     conversations.ts # conversations + messages (cross-document)
   auth/        # AuthContext, provider, useAuth hook, ProtectedRoute
-  components/  # Layout, States, MessageBubble, ModelStatus, Confidence,
+  components/  # Layout, Sidebar, States, MessageBubble, ModelStatus,
                # ProgressBar, DocumentUpload, ConversationList, DocumentScope
+  conversations/ # ConversationsContext (shared chat list)
   hooks/       # useDocuments (list + progress polling)
   lib/         # formatting helpers
   pages/       # LoginPage, DocumentsPage, ChatPage
@@ -69,39 +68,36 @@ The frontend talks to the backend over REST. Base URL comes from `VITE_API_URL`
 (default `http://localhost:8000/api`). Authenticated requests send
 `Authorization: Bearer <jwt>`.
 
-> ⚠️ This contract is what the frontend codes against. Items marked **(NEW)** are
-> not yet implemented by the backend — see `docs/FRONTEND_API_CONTRACT.md` for the
-> exact backend changes required.
-
 | Method & path                       | Body                                  | Returns                              |
 | ----------------------------------- | ------------------------------------- | ------------------------------------ |
 | `POST /auth/register`               | `{ email, password }`                 | `{ token, user }`                    |
 | `POST /auth/login`                  | `{ email, password }`                 | `{ token, user }`                    |
 | `GET  /auth/me`                     | —                                     | `{ user }`                           |
 | `GET  /documents`                   | —                                     | `Document[]`                         |
-| `POST /documents` **(NEW)**         | `multipart/form-data`: `file`, `title?` | `Document` (`status:PROCESSING`)  |
-| `GET  /documents/:id`               | —                                     | `Document` (incl. `progress`) **(NEW field)** |
+| `POST /documents`                   | `multipart/form-data`: `file`, `title?` | `Document` (`status:PROCESSING`)  |
+| `GET  /documents/:id`               | —                                     | `Document` (incl. `progress`)        |
 | `DELETE /documents/:id`             | —                                     | `204`                                |
 | `GET  /conversations`               | —                                     | `Conversation[]`                     |
-| `POST /conversations` **(NEW)**     | `{ title?, documentIds? }` (no required doc) | `Conversation`                |
+| `POST /conversations`               | `{ title?, documentIds? }`            | `Conversation`                       |
 | `GET  /conversations/:id`           | —                                     | `Conversation` (with `messages`)     |
-| `POST /conversations/:id/messages`  | `{ content, documentIds? }` **(NEW field)** | `{ userMessage, assistantMessage }` |
+| `PATCH /conversations/:id`          | `{ title }`                           | `Conversation` (rename)              |
+| `DELETE /conversations/:id`         | —                                     | `204`                                |
+| `POST /conversations/:id/messages`  | `{ content, documentIds? }`           | `{ userMessage, assistantMessage }` |
 
 The assistant `Message` includes AI metadata: `model`, `promptTokens`,
-`completionTokens`, `confidence` (0–1), and `sources[]` (`{ documentId,
-documentTitle?, snippet, score?, page? }`). See `src/types/index.ts`.
+`completionTokens`, and `sources[]` (`{ documentId, documentTitle?, snippet,
+score?, page? }`). See `src/types/index.ts`.
 
-## Local development
+## Development
+
+The app runs as part of the Docker Compose stack (see the root `README.md`);
+the SPA is built and served behind nginx, with `VITE_API_URL` supplied as a
+Docker build arg (`/api`, proxied to the backend).
+
+These package scripts are available for working on the frontend in isolation:
 
 ```bash
 pnpm install
-cp .env.example .env   # adjust VITE_API_URL if your backend isn't on :8000
-pnpm dev               # http://localhost:5173
-```
-
-Other scripts:
-
-```bash
 pnpm build    # type-check (tsc -b) + production build to dist/
 pnpm lint     # ESLint
 pnpm test     # run the Vitest suite once
@@ -117,9 +113,8 @@ matters for the AI-aware UX and API integration:
 
 - `api/client` — base URL, JWT header, body serialization, 204 handling, and
   `ApiError` normalization (including network failures).
-- `components/Confidence` — confidence thresholds and the low-confidence warning.
-- `components/MessageBubble` — user vs. assistant rendering, sources, token
-  metadata, uncertainty notice, and the re-ask action.
+- `components/MessageBubble` — user vs. assistant rendering, sources, and token
+  metadata, plus the re-ask action.
 - `components/States`, `ModelStatus`, `DocumentStatusBadge` — loading/error/empty
   and status indicators.
 

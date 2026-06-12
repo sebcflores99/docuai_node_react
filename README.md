@@ -21,9 +21,9 @@
 
 **DocuAI** lets users extract insights from their own documents through conversation. Users can:
 
-1. **Add a document** (paste text) via a React frontend
+1. **Add a document** (upload a PDF/DOCX/text file, or paste text) via a React frontend
 2. **Ask questions** about its content in natural language
-3. **Receive grounded answers** with a confidence signal and **source citations (file + page)**
+3. **Receive grounded answers** with **source citations (file + page)**
 4. **Refine and re-ask** across a multi-turn conversation
 
 ### Runs offline by default
@@ -53,15 +53,15 @@ This implements **"AI assistant that answers questions about uploaded documents"
 │          · /api/conversations                                │
 │  Middleware: JWT auth · zod validation · error handling      │
 │                                                              │
-│  AI layer (provider-agnostic):                               │
-│   ├─ Prompt construction (versioned template + context)     │
-│   ├─ Model invocation   (mock | openai | anthropic)         │
-│   └─ Response post-processing (JSON parse → structured)     │
+│  Two-agent AI layer (provider-agnostic):                     │
+│   ├─ General agent: answers directly, or calls a tool        │
+│   ├─ Tool: search_documents  →  RAG agent (function calling)  │
+│   └─ Providers: mock | openai | anthropic (one interface)     │
 │                                                              │
 │  RAG layer:                                                  │
 │   ├─ Chunker (page-aware)                                   │
 │   ├─ Embedder (mock | openai) — vectors computed in-app     │
-│   └─ Retrieval (Weaviate nearVector, scoped per document)   │
+│   └─ Retrieval (Weaviate nearVector, per-user tenant)       │
 └────┬──────────────────┬───────────────────┬─────────────────┘
      │                  │                   │
 ┌────▼────┐    ┌────────▼────────┐   ┌──────▼───────────────┐
@@ -90,8 +90,7 @@ Embeddings are **computed by the backend** and stored in Weaviate with `vectoriz
 
 ### Prerequisites
 
-- **Docker** & **Docker Compose** (for the containerized stack)
-- For local dev without Docker: **Node 20+** and **pnpm 10** (`corepack enable`)
+- **Docker** & **Docker Compose** (the app runs entirely in containers)
 - **No API keys required** for the default mock providers
 
 ### Quick Start (with Docker)
@@ -112,26 +111,6 @@ Service URLs:
 - Frontend: http://localhost:3000
 - Backend health: http://localhost:8000/api/health
 - Weaviate ready: http://localhost:8080/v1/.well-known/ready
-
-### Local Development (without Docker)
-
-You'll need Postgres and Weaviate running (e.g. `docker compose up -d postgres weaviate`).
-
-```bash
-# Backend
-cd backend
-pnpm install
-cp .env.example .env        # then edit values
-pnpm prisma:migrate         # apply migrations (prisma migrate dev)
-pnpm dev                    # http://localhost:8000
-
-# Frontend (separate terminal)
-cd docu-ai-front
-pnpm install
-pnpm dev                    # http://localhost:5173 (Vite dev server)
-```
-
-For local dev the frontend reads `VITE_API_URL` (defaults to `http://localhost:8000/api`).
 
 ### Environment Setup
 
@@ -200,21 +179,25 @@ GET  /api/auth/me            # requires auth
 
 ```http
 GET    /api/documents          # list own documents
-POST   /api/documents          # { "title": "...", "content": "..." }
+POST   /api/documents          # multipart file upload, or JSON { title, content }
 GET    /api/documents/:id
 DELETE /api/documents/:id      # 204; also removes vector chunks
 ```
 
-On create, the document is chunked, embedded, and stored; its `status` moves `PROCESSING → READY` (or `FAILED` if ingestion errors, in which case retrieval falls back to full text).
+On create, the document is extracted (PDF/DOCX/text), chunked, embedded, and stored **in the background**; its `status` moves `PROCESSING → READY` (or `FAILED` if ingestion errors). The full ingestion lifecycle is logged as structured JSON.
 
 ### Conversations & Messages
 
 ```http
-GET  /api/conversations?documentId=<id>     # list (optionally filtered)
-POST /api/conversations                     # { "documentId": "...", "title?": "..." }
-GET  /api/conversations/:id                 # conversation + messages[]
-POST /api/conversations/:id/messages        # { "content": "your question" }
+GET    /api/conversations?documentId=<id>     # list (optionally filtered)
+POST   /api/conversations                     # { documentIds?: [...], title?: "..." }
+GET    /api/conversations/:id                 # conversation + messages[]
+PATCH  /api/conversations/:id                 # { title } — rename
+DELETE /api/conversations/:id                 # 204
+POST   /api/conversations/:id/messages        # { content, documentIds? }
 ```
+
+With no `documentIds`, a conversation searches across **all** the user's READY documents; pass a subset to scope retrieval.
 
 **`POST /:id/messages` response** — persists the user turn and the grounded assistant turn:
 ```json
@@ -224,8 +207,7 @@ POST /api/conversations/:id/messages        # { "content": "your question" }
     "id": "uuid",
     "role": "ASSISTANT",
     "content": "...answer...\n\nSources: France Facts (p. 1)",
-    "confidence": 0.65,
-    "model": "mock-model",
+    "model": "gpt-4o-mini",
     "promptTokens": 210,
     "completionTokens": 45,
     "sources": [
@@ -236,19 +218,21 @@ POST /api/conversations/:id/messages        # { "content": "your question" }
 }
 ```
 
-`confidence` is normalized to `0..1` (low/medium/high → 0.3/0.65/0.9). `sources` are derived from the **actually retrieved chunks**, and the answer text gets an appended `Sources: <file> (pp. X–Y)` footer.
+`sources` are derived from the **actually retrieved chunks** (not model self-report), and the answer text gets an appended `Sources: <file> (pp. X–Y)` footer.
 
 ---
 
 ## AI Design & Implementation
 
-### Clear separation of concerns
+### Two-agent design & separation of concerns
 
-The AI pipeline is split into three independently testable stages (per the assessment):
+A **general agent** answers the user. It is given a single tool, `search_documents`, and decides at inference time whether to call it. When it does, a **RAG agent** embeds the query, retrieves the most relevant passages from the user's documents, and feeds them back so the general agent can answer from real content. The loop is capped at two tool rounds.
 
-- **Prompt construction** — `services/ai/promptBuilder.ts` wraps the question and retrieved context in explicit `<context>` / `<question>` delimiters using the active prompt template.
-- **Model invocation** — `services/ai/providers/*` implement a single `LLMProvider` interface; the rest of the app never imports a vendor SDK directly.
-- **Response post-processing** — `services/ai/postProcess.ts` defensively parses the model output into `{ answer, confidence, citations }` (strips code fences, extracts the JSON object, falls back to low-confidence prose).
+The pipeline keeps the three stages the assessment asks for cleanly separated and independently testable:
+
+- **Prompt construction** — `services/ai/promptVersion.ts` holds the versioned system prompt; `ai.service.ts` assembles the message list (system + history + user) and the tool schema.
+- **Model invocation** — `services/ai/providers/*` implement one `LLMProvider` interface (including tool calling); the rest of the app never imports a vendor SDK directly.
+- **Response post-processing** — `services/rag/sources.ts` turns the retrieved chunks into structured `sources[]` and the human-readable `Sources: <file> (p. X)` footer that is appended to the answer.
 
 ### LLM provider abstraction
 
@@ -259,7 +243,7 @@ interface LLMProvider {
 }
 ```
 
-A factory (`services/ai/providers/index.ts`) selects the implementation from `LLM_PROVIDER` and caches it. Adding a provider means implementing the interface and registering it — no call-site changes.
+The request/result types carry optional `tools` and `toolCalls`, so function calling is part of the provider contract — implemented for OpenAI, Anthropic, and the offline mock (which deterministically simulates a `search_documents` call). A factory (`services/ai/providers/index.ts`) selects the implementation from `LLM_PROVIDER` and caches it. Adding a provider means implementing the interface and registering it — no call-site changes.
 
 ### Prompt versioning
 
@@ -267,20 +251,20 @@ The active system prompt lives in the `PromptVersion` table (name, version, temp
 
 ### Prompt-injection & unsafe input
 
-1. **Validation** — zod schemas cap question/content/context length and reject malformed bodies.
+1. **Validation** — zod schemas cap question/content/title length and reject malformed bodies.
 2. **Control-char sanitization** — stripped from user input before it reaches the model.
-3. **Delimited, data-not-instructions framing** — the system prompt instructs the model to treat `<context>`/`<question>` strictly as data and never to follow instructions found inside them.
-4. **Schema-enforced output** — responses are validated/normalized, never `eval`'d.
+3. **Data-not-instructions framing** — the system prompt instructs the model to treat all document content and user questions strictly as data and never to follow instructions found inside them.
+4. **Tool output is data** — retrieved passages are returned as a labeled tool result, never executed.
 5. **Body size limit** — `express.json({ limit: '1mb' })`.
 
 ### RAG flow
 
-1. On upload, text is **chunked** (≈1000 chars, 150 overlap) with **page tracking** — synthetic ~1800-char pages, or real form-feed (`\f`) breaks when present.
-2. Each chunk is **embedded in the backend** and stored in Weaviate with `{documentId, ownerId, title, chunkIndex, pageStart, pageEnd}`.
-3. A question is embedded and matched via `nearVector`, **scoped to the document** (top-K = 4).
-4. Retrieved chunks become the labeled context block; sources + page footer are derived from them.
+1. On upload, text is extracted (PDF/DOCX/text) and **chunked** (~1000 chars, 150 overlap) with **page tracking** — real PDF page boundaries when available, else synthetic ~1800-char pages (or form-feed `\f` breaks).
+2. Each chunk is **embedded in the backend** and stored in Weaviate under the user's **tenant** with `{documentId, ownerId, title, chunkIndex, pageStart, pageEnd}`.
+3. When the general agent calls `search_documents`, the question is embedded and matched via `nearVector` within the user's tenant (top-K = 6), optionally narrowed to a document subset.
+4. Retrieved chunks become the tool result; structured `sources` + the page footer are derived from them.
 
-If retrieval fails or returns nothing (vector store down, not yet indexed), it **gracefully falls back** to the document's full text so answers still work.
+If retrieval fails or returns nothing (vector store down, not yet indexed), the tool returns "no relevant passages" and the agent says it couldn't find the answer in the user's documents — it never fabricates.
 
 ### Cost & rate limiting (strategy)
 
@@ -293,9 +277,10 @@ If retrieval fails or returns nothing (vector store down, not yet indexed), it *
 
 ### Handling hallucinations / uncertainty
 
-- System prompt: answer **only** from context, else say so → low confidence.
-- Confidence surfaced numerically; the UI shows a warning + nudge to verify when low.
-- Truthful **citations** drawn from retrieved chunks (not model self-report), shown with file + page.
+- The system prompt forces the model to search before answering factual questions, to ground its answer **only** in the retrieved passages, and to prefer document facts over its own prior knowledge.
+- When nothing relevant is retrieved, the model says it **couldn't find the answer in the user's documents** rather than guessing.
+- Every grounded claim ships with **citations** (file + page) drawn from the actual retrieved chunks — a verifiable trust signal the user can check.
+- We deliberately **dropped a self-reported confidence score**: LLMs are poorly calibrated, so a fabricated "90% confident" is more misleading than honest, source-backed citations.
 
 ---
 
@@ -303,7 +288,7 @@ If retrieval fails or returns nothing (vector store down, not yet indexed), it *
 
 ### Secrets approach
 
-A single root **`.env`** (gitignored) holds shared secrets and is injected by Docker Compose. `*.env.example` files are committed as templates; `make init`/`make up` generate a working `.env` for local demos.
+A single root **`.env`** (gitignored) holds shared secrets and is injected by Docker Compose. The committed **`.env.example`** is a template; `make init`/`make up` generate a working `.env` for local demos.
 
 ```
 .env            ← OPENAI_API_KEY, ANTHROPIC_API_KEY, JWT_SECRET, provider switches
@@ -340,7 +325,7 @@ In production these keys would live in **AWS Secrets Manager / SSM**, not a file
 | User credentials  | Postgres | email + **bcrypt** hash (never plaintext)                    |
 | Documents         | Postgres | user-owned text content                                      |
 | Document chunks   | Weaviate | text + embedding vector + page metadata                      |
-| Conversations/Messages | Postgres | includes model, token counts, confidence, sources      |
+| Conversations/Messages | Postgres | includes model, token counts, sources                   |
 | API keys          | —        | env/secret store only; never persisted in the DB            |
 
 ### Retention & PII (policy)
@@ -359,13 +344,12 @@ See **`docs/PART2_AI_DATA_AND_ARCHITECTURE.md`** for the full Part 2 write-up (e
 | Decision               | Trade-off                              | Mitigation / future                          |
 |------------------------|----------------------------------------|----------------------------------------------|
 | Mock providers default | Mock embeddings are lexical, not semantic | Set `*_PROVIDER=openai` for real retrieval |
-| Synchronous ingestion  | Large docs block the create request    | Move to a queue/worker (status already modeled) |
 | Synchronous LLM calls  | Request blocks during model latency     | Streaming + async queue                      |
 | Single backend instance| No horizontal scaling                   | Stateless JWT already enables scaling out    |
 | Stateless JWT          | Can't revoke a token before expiry      | Short TTL; Redis blacklist in prod           |
-| Char-offset "pages"    | Synthetic for pasted text               | Real page extraction when PDF upload is added |
+| In-process ingestion   | Background task tied to the API process | Already non-blocking; move to a queue/worker for durability + retries |
 
-**AI limitations:** hallucinations (mitigated via citations + confidence), context-window limits (mitigated via chunking/retrieval), and cost at scale (caching/batching/cheaper models).
+**AI limitations:** hallucinations (mitigated via forced retrieval + verifiable citations), context-window limits (mitigated via chunking/retrieval), and cost at scale (caching/batching/cheaper models).
 
 ---
 
@@ -390,12 +374,12 @@ IaC:
 
 ## Bonus & Future Work
 
-- **Vector store + RAG (implemented ✅)** — Weaviate, backend-computed embeddings, page-aware citations, graceful fallback.
+- **Tool / function calling (implemented ✅)** — the general agent invokes a `search_documents` tool; the RAG agent runs retrieval and feeds results back.
+- **Vector store + RAG (implemented ✅)** — Weaviate, backend-computed embeddings, per-user multi-tenancy, page-aware citations.
+- **Background async processing (implemented ✅)** — document extraction + embedding run in the background; `status` lifecycle (`PROCESSING/READY/FAILED`) with structured logs. Next: a durable queue (Bull/SQS) for retries.
 - **Provider abstraction + prompt versioning (implemented ✅)**.
-- **Async processing (planned)** — document `status` lifecycle is already modeled (`PROCESSING/READY/FAILED`); move ingestion to a Bull/SQS worker.
 - **Streaming responses (planned)** — token-by-token SSE for the chat endpoint.
 - **Rate limiting (planned)** — see strategy above.
-- **Automated tests (planned)** — pure logic (chunker pages, source footer, post-processing) is structured to be unit-testable.
 
 ### Indicative cost (real OpenAI; mock = $0)
 

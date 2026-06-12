@@ -1,25 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
-import type { Conversation, Document, Message } from '../types';
+import { useNavigate, useParams } from 'react-router-dom';
+import type { Document, Message } from '../types';
 import * as convApi from '../api/conversations';
 import { listDocuments } from '../api/documents';
 import { ApiError } from '../api/client';
-import { Loading, ErrorState, EmptyState } from '../components/States';
+import { Loading, ErrorState } from '../components/States';
 import { MessageBubble } from '../components/MessageBubble';
 import { ModelStatus } from '../components/ModelStatus';
 import type { ModelPhase } from '../components/ModelStatus';
-import { ConversationList } from '../components/ConversationList';
 import { DocumentScope } from '../components/DocumentScope';
+import { useConversations } from '../conversations/ConversationsContext';
 import { messageSchema, validate } from '../validation/schemas';
 
-// Cross-document chat: ask questions answered from any of the user's READY
-// documents. Conversations are listed in a sidebar; answers cite their sources.
+// Focused, single-thread chat view (the conversation history lives in the
+// persistent sidebar). Answers are grounded in the user's documents via the
+// RAG agent and cite their sources.
 export function ChatPage() {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
+  const { addConversation } = useConversations();
 
-  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [scopeIds, setScopeIds] = useState<string[]>([]);
@@ -35,24 +36,18 @@ export function ChatPage() {
   const listRef = useRef<HTMLDivElement>(null);
   const loadedRef = useRef<string | null>(null);
 
-  // Initial load: conversations + documents.
+  // Initial load: documents (for the scope picker).
   useEffect(() => {
     let active = true;
     void (async () => {
       try {
-        const [convs, docs] = await Promise.all([
-          convApi.listConversations(),
-          listDocuments(),
-        ]);
+        const docs = await listDocuments();
         if (!active) return;
-        setConversations(convs);
         setDocuments(docs);
         setLoadError(null);
       } catch (err) {
         if (active) {
-          setLoadError(
-            err instanceof ApiError ? err.message : 'Failed to load chats.',
-          );
+          setLoadError(err instanceof ApiError ? err.message : 'Failed to load chat.');
         }
       } finally {
         if (active) setLoading(false);
@@ -63,11 +58,18 @@ export function ChatPage() {
     };
   }, [reloadKey]);
 
-  // Load the active conversation's messages when the route changes.
+  // Load the active conversation's messages when the route changes; clear when
+  // starting a fresh chat (no route id).
   useEffect(() => {
     let active = true;
+    if (!routeId) {
+      setMessages([]);
+      loadedRef.current = null;
+      setPhase('idle');
+      return;
+    }
     void (async () => {
-      if (!routeId || loadedRef.current === routeId) return;
+      if (loadedRef.current === routeId) return;
       try {
         const conv = await convApi.getConversation(routeId);
         if (!active) return;
@@ -86,13 +88,6 @@ export function ChatPage() {
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [messages, phase]);
-
-  const startNewChat = useCallback(() => {
-    setMessages([]);
-    loadedRef.current = null;
-    setPhase('idle');
-    navigate('/chat');
-  }, [navigate]);
 
   const send = useCallback(
     async (content: string) => {
@@ -117,7 +112,7 @@ export function ChatPage() {
           });
           convId = conv.id;
           loadedRef.current = conv.id;
-          setConversations((prev) => [conv, ...prev]);
+          addConversation(conv);
           navigate(`/chat/${conv.id}`, { replace: true });
         }
 
@@ -134,7 +129,7 @@ export function ChatPage() {
         setPhase('error');
       }
     },
-    [routeId, scopeIds, navigate, phase],
+    [routeId, scopeIds, navigate, phase, addConversation],
   );
 
   function handleSubmit(e: FormEvent) {
@@ -167,84 +162,62 @@ export function ChatPage() {
   const readyCount = documents.filter((d) => d.status === 'READY').length;
 
   return (
-    <div className="chat-layout">
-      <ConversationList
-        conversations={conversations}
-        activeId={routeId ?? null}
-        onSelect={(id) => navigate(`/chat/${id}`)}
-        onNew={startNewChat}
-      />
-
-      <div className="chat-main">
-        {readyCount === 0 ? (
-          <EmptyState
-            title="No documents ready yet"
-            detail="Upload and process a document before chatting."
-            action={
-              <Link to="/documents" className="btn btn-primary">
-                Go to documents
-              </Link>
-            }
-          />
-        ) : (
-          <>
-            <div className="chat-messages" ref={listRef}>
-              {messages.length === 0 && phase === 'idle' && (
-                <div className="chat-intro">
-                  <h2>Ask about your documents</h2>
-                  <p className="muted">
-                    Questions are answered from your {readyCount} ready document
-                    {readyCount === 1 ? '' : 's'}. Each answer shows the passages it
-                    used.
-                  </p>
-                </div>
-              )}
-
-              {messages.map((m) => (
-                <MessageBubble
-                  key={m.id}
-                  message={m}
-                  onReask={phase !== 'thinking' ? (c) => void send(c) : undefined}
-                />
-              ))}
-
-              <ModelStatus phase={phase} />
-            </div>
-
-            <form onSubmit={handleSubmit} className="chat-input">
-              <DocumentScope
-                documents={documents}
-                selected={scopeIds}
-                onChange={setScopeIds}
-              />
-              <div className="chat-input-row">
-                <textarea
-                  rows={2}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSubmit(e);
-                    }
-                  }}
-                  placeholder="Ask a question about your documents…"
-                  disabled={phase === 'thinking'}
-                  aria-invalid={Boolean(inputError)}
-                />
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  disabled={phase === 'thinking' || !input.trim()}
-                >
-                  {phase === 'thinking' ? 'Thinking…' : 'Ask'}
-                </button>
-              </div>
-              {inputError && <span className="field-error">{inputError}</span>}
-            </form>
-          </>
+    <div className="chat-view">
+      <div className="chat-messages" ref={listRef}>
+        {messages.length === 0 && phase === 'idle' && (
+          <div className="chat-intro">
+            <span className="chat-intro-mark" aria-hidden="true">◆</span>
+            <h2>How can I help?</h2>
+            <p className="muted">
+              {readyCount > 0
+                ? `Ask anything — I can search your ${readyCount} ready document${
+                    readyCount === 1 ? '' : 's'
+                  } and cite the passages I use.`
+                : 'Ask me anything. Upload documents to ground my answers in your own content.'}
+            </p>
+          </div>
         )}
+
+        {messages.map((m) => (
+          <MessageBubble
+            key={m.id}
+            message={m}
+            onReask={phase !== 'thinking' ? (c) => void send(c) : undefined}
+          />
+        ))}
+
+        <ModelStatus phase={phase} />
       </div>
+
+      <form onSubmit={handleSubmit} className="composer">
+        <div className="composer-box">
+          <textarea
+            rows={1}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit(e);
+              }
+            }}
+            placeholder="Message DocuAI…"
+            disabled={phase === 'thinking'}
+            aria-invalid={Boolean(inputError)}
+          />
+          <div className="composer-bar">
+            <DocumentScope documents={documents} selected={scopeIds} onChange={setScopeIds} />
+            <button
+              type="submit"
+              className="btn btn-primary composer-send"
+              disabled={phase === 'thinking' || !input.trim()}
+            >
+              {phase === 'thinking' ? 'Thinking…' : 'Send'}
+            </button>
+          </div>
+        </div>
+        {inputError && <span className="field-error">{inputError}</span>}
+      </form>
     </div>
   );
 }

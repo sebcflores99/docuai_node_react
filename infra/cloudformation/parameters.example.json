@@ -1,0 +1,58 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "docuai"
+  },
+  {
+    "ParameterKey": "EnvironmentName",
+    "ParameterValue": "prod"
+  },
+  {
+    "ParameterKey": "GitHubOrg",
+    "ParameterValue": "your-github-org"
+  },
+  {
+    "ParameterKey": "GitHubRepo",
+    "ParameterValue": "FS_AI_ENG_Assessment"
+  },
+  {
+    "ParameterKey": "GitHubBranch",
+    "ParameterValue": "main"
+  },
+  {
+    "ParameterKey": "BackendImageTag",
+    "ParameterValue": "latest"
+  },
+  {
+    "ParameterKey": "DeployBackendService",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "DBInstanceClass",
+    "ParameterValue": "db.t4g.micro"
+  },
+  {
+    "ParameterKey": "DBAllocatedStorage",
+    "ParameterValue": "20"
+  },
+  {
+    "ParameterKey": "AppRunnerCpu",
+    "ParameterValue": "1 vCPU"
+  },
+  {
+    "ParameterKey": "AppRunnerMemory",
+    "ParameterValue": "2 GB"
+  },
+  {
+    "ParameterKey": "AppRunnerMaxConcurrency",
+    "ParameterValue": "50"
+  },
+  {
+    "ParameterKey": "AppRunnerMinSize",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "AppRunnerMaxSize",
+    "ParameterValue": "5"
+  }
+]

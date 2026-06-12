@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Document } from '../types';
 import * as docsApi from '../api/documents';
@@ -8,7 +8,7 @@ import { Loading, ErrorState, EmptyState } from '../components/States';
 import { DocumentStatusBadge } from '../components/DocumentStatusBadge';
 import { DocumentUpload } from '../components/DocumentUpload';
 import { ProgressBar } from '../components/ProgressBar';
-import { formatBytes, formatDate } from '../lib/format';
+import { formatBytes, formatDate, fileExtension } from '../lib/format';
 
 // Documents management: upload files, watch ingestion progress, delete.
 export function DocumentsPage() {
@@ -16,6 +16,8 @@ export function DocumentsPage() {
     useDocuments();
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState('');
+  const [extension, setExtension] = useState('');
 
   async function handleUpload(file: File, title?: string) {
     setUploadError(null);
@@ -43,6 +45,29 @@ export function DocumentsPage() {
   }
 
   const readyCount = documents.filter((d) => d.status === 'READY').length;
+
+  // Distinct extensions present across the user's documents, for the dropdown.
+  const extensions = useMemo(() => {
+    const set = new Set<string>();
+    for (const doc of documents) {
+      const ext = fileExtension(doc.fileName);
+      if (ext) set.add(ext);
+    }
+    return [...set].sort();
+  }, [documents]);
+
+  // Client-side filtering by keyword (title/file name) and by extension.
+  const filtered = useMemo(() => {
+    const term = keyword.trim().toLowerCase();
+    return documents.filter((doc) => {
+      if (extension && fileExtension(doc.fileName) !== extension) return false;
+      if (!term) return true;
+      const haystack = `${doc.title} ${doc.fileName ?? ''}`.toLowerCase();
+      return haystack.includes(term);
+    });
+  }, [documents, keyword, extension]);
+
+  const hasFilters = keyword.trim() !== '' || extension !== '';
 
   return (
     <div className="documents-page">
@@ -73,6 +98,44 @@ export function DocumentsPage() {
           )}
         </div>
 
+        {!loading && !error && documents.length > 0 && (
+          <div className="doc-filters">
+            <input
+              type="search"
+              className="doc-filter-search"
+              placeholder="Filter by keyword…"
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              aria-label="Filter documents by keyword"
+            />
+            <select
+              className="doc-filter-ext"
+              value={extension}
+              onChange={(e) => setExtension(e.target.value)}
+              aria-label="Filter documents by extension"
+            >
+              <option value="">All extensions</option>
+              {extensions.map((ext) => (
+                <option key={ext} value={ext}>
+                  .{ext}
+                </option>
+              ))}
+            </select>
+            {hasFilters && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => {
+                  setKeyword('');
+                  setExtension('');
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+
         {loading ? (
           <Loading label="Loading documents…" />
         ) : error ? (
@@ -82,9 +145,14 @@ export function DocumentsPage() {
             title="No documents yet"
             detail="Upload your first document above to start asking questions."
           />
+        ) : filtered.length === 0 ? (
+          <EmptyState
+            title="No matching documents"
+            detail="Try a different keyword or extension."
+          />
         ) : (
           <ul className="doc-cards">
-            {documents.map((doc) => (
+            {filtered.map((doc) => (
               <li key={doc.id} className="card doc-card">
                 <div className="doc-card-head">
                   <div className="doc-card-title">

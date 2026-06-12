@@ -22,11 +22,16 @@ export interface TextChunk {
   pageEnd: number;
 }
 
-export function chunkDocument(content: string): TextChunk[] {
-  const text = content.replace(/\r\n/g, '\n');
+export function chunkDocument(content: string, explicitPageBoundaries?: number[]): TextChunk[] {
+  // When real page boundaries are supplied (e.g. from PDF extraction) we must
+  // not rewrite the text, or the offsets would drift out of alignment.
+  const hasExplicit = Boolean(explicitPageBoundaries && explicitPageBoundaries.length > 0);
+  const text = hasExplicit ? content : content.replace(/\r\n/g, '\n');
   if (!text.trim()) return [];
 
-  const pageBoundaries = computePageBoundaries(text);
+  const pageBoundaries = hasExplicit
+    ? (explicitPageBoundaries as number[])
+    : computePageBoundaries(text);
   const segments = splitIntoSegments(text);
 
   const chunks: TextChunk[] = [];

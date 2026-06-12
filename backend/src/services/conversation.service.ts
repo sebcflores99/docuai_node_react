@@ -1,57 +1,57 @@
 import type { Message } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { AppError, badRequest } from '../lib/errors';
+import { logger } from '../lib/logger';
 import * as documentService from './document.service';
-import {
-  MAX_CONTEXT_CHARS,
-  generateAnswer,
-  sanitizeInput,
-} from './ai/ai.service';
-import type { Confidence } from './ai/postProcess';
+import { generateAnswer, sanitizeInput } from './ai/ai.service';
 import type { LLMMessage } from './ai/providers/types';
 import * as rag from './rag/rag.service';
 import type { RetrievedChunk } from './rag/weaviate';
-import {
-  type MessageSource,
-  buildContextBlock,
-  buildSourceFooter,
-  buildSources,
-} from './rag/sources';
+import { type MessageSource, buildSourceFooter, buildSources } from './rag/sources';
 
 const MAX_HISTORY_MESSAGES = 10;
 
-// Maps the model's qualitative confidence onto the 0..1 scale the UI renders.
-const CONFIDENCE_SCORE: Record<Confidence, number> = {
-  low: 0.3,
-  medium: 0.65,
-  high: 0.9,
-};
+export interface CreateConversationInput {
+  userId: string;
+  title?: string;
+  documentIds?: string[];
+}
 
 export interface SendMessageInput {
   userId: string;
   conversationId: string;
   content: string;
+  documentIds?: string[];
+}
+
+export interface SendMessageResult {
+  userMessage: Message;
+  assistantMessage: Message;
 }
 
 export function listConversations(userId: string, documentId?: string) {
   return prisma.conversation.findMany({
-    where: { userId, ...(documentId ? { documentId } : {}) },
+    where: {
+      userId,
+      ...(documentId ? { documentIds: { has: documentId } } : {}),
+    },
     orderBy: { updatedAt: 'desc' },
   });
 }
 
-export async function createConversation(
-  userId: string,
-  documentId: string,
-  title?: string,
-) {
-  // Ownership of the linked document is enforced before creating.
-  const document = await documentService.getDocument(userId, documentId);
+export async function createConversation(input: CreateConversationInput) {
+  const documentIds = input.documentIds ?? [];
+  // Validate ownership of any explicitly-scoped documents up front.
+  const documents = await assertOwnedDocuments(input.userId, documentIds);
+
+  const defaultTitle =
+    documents.length === 1 ? documents[0].title : 'New conversation';
+
   return prisma.conversation.create({
     data: {
-      userId,
-      documentId: document.id,
-      title: title?.trim() || document.title,
+      userId: input.userId,
+      documentIds,
+      title: input.title?.trim() || defaultTitle,
     },
   });
 }
@@ -67,9 +67,37 @@ export async function getConversation(userId: string, conversationId: string) {
   return conversation;
 }
 
-export interface SendMessageResult {
-  userMessage: Message;
-  assistantMessage: Message;
+/** Deletes a conversation (and its messages, via cascade) after ownership check. */
+export async function deleteConversation(userId: string, conversationId: string): Promise<void> {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { userId: true },
+  });
+  if (!conversation || conversation.userId !== userId) {
+    throw new AppError(404, 'Conversation not found', 'NOT_FOUND');
+  }
+  await prisma.conversation.delete({ where: { id: conversationId } });
+}
+
+/** Renames a conversation after an ownership check. */
+export async function renameConversation(
+  userId: string,
+  conversationId: string,
+  title: string,
+) {
+  const conversation = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { userId: true },
+  });
+  if (!conversation || conversation.userId !== userId) {
+    throw new AppError(404, 'Conversation not found', 'NOT_FOUND');
+  }
+  const trimmed = title.trim();
+  if (!trimmed) throw badRequest('Title must not be empty');
+  return prisma.conversation.update({
+    where: { id: conversationId },
+    data: { title: trimmed },
+  });
 }
 
 export async function sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
@@ -83,14 +111,21 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
     data: { conversationId: conversation.id, role: 'USER', content },
   });
 
-  const { context, chunks } = await buildRetrievalContext(
-    input.userId,
-    conversation.documentId,
-    content,
-  );
+  const scopeIds = await resolveScope(input.userId, conversation.documentIds, input.documentIds);
 
-  const result = await generateAnswer({ question: content, context, history });
+  // The general agent answers directly or calls the RAG agent (search_documents)
+  // to ground its answer. The tool is only offered when the user has documents
+  // in scope, so general chats skip retrieval entirely.
+  const result = await generateAnswer({
+    question: content,
+    history,
+    searchDocuments:
+      scopeIds.length > 0
+        ? (query) => retrieveScoped(input.userId, scopeIds, query)
+        : undefined,
+  });
 
+  const chunks = result.retrievedChunks;
   const sources = buildSources(chunks);
   const footer = buildSourceFooter(chunks);
   const answer = footer ? `${result.answer}\n\n${footer}` : result.answer;
@@ -104,7 +139,6 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       promptTokens: result.usage.promptTokens,
       completionTokens: result.usage.completionTokens,
       promptVersionId: result.promptVersion.id,
-      confidence: CONFIDENCE_SCORE[result.confidence],
       sources: sources.length > 0 ? (sources as unknown as object) : undefined,
     },
   });
@@ -117,36 +151,58 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   return { userMessage, assistantMessage };
 }
 
-interface RetrievalContext {
-  context?: string;
-  chunks: RetrievedChunk[];
+/**
+ * Resolves which documents to search for a message:
+ *  1. an explicit per-message subset (validated for ownership), else
+ *  2. the conversation's bound documents, else
+ *  3. all of the user's READY documents (cross-document chat).
+ */
+async function resolveScope(
+  userId: string,
+  conversationDocIds: string[],
+  messageDocIds?: string[],
+): Promise<string[]> {
+  if (messageDocIds && messageDocIds.length > 0) {
+    await assertOwnedDocuments(userId, messageDocIds);
+    return messageDocIds;
+  }
+  if (conversationDocIds.length > 0) return conversationDocIds;
+  return documentService.listReadyDocumentIds(userId);
 }
 
 /**
- * Retrieves relevant chunks for the question via RAG. If retrieval yields
- * nothing (no linked document, vector store unavailable, or not yet indexed),
- * it gracefully falls back to the document's full text so answers still work.
+ * The RAG agent: embeds the query and returns the most relevant chunks across
+ * the scoped documents. Returns an empty list (so the model answers
+ * conservatively) when there's nothing to search or the vector store is down.
  */
-async function buildRetrievalContext(
+async function retrieveScoped(
   userId: string,
-  documentId: string | null,
+  documentIds: string[],
   question: string,
-): Promise<RetrievalContext> {
-  if (!documentId) return { chunks: [] };
-
-  const document = await documentService.getDocument(userId, documentId);
-
+): Promise<RetrievedChunk[]> {
+  if (documentIds.length === 0) return [];
   try {
-    const chunks = await rag.retrieve(documentId, question);
-    if (chunks.length > 0) {
-      return { context: buildContextBlock(chunks), chunks };
-    }
+    return await rag.retrieve({ ownerId: userId, documentIds }, question);
   } catch (err) {
-    console.error(`RAG retrieval failed for document ${documentId}:`, err);
+    logger.error('rag.retrieve_failed', {
+      ownerId: userId,
+      documents: documentIds.length,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
   }
+}
 
-  // Fallback: inline (truncated) full document text.
-  return { context: document.content.slice(0, MAX_CONTEXT_CHARS), chunks: [] };
+/** Ensures every id belongs to the user; returns the loaded documents. */
+async function assertOwnedDocuments(userId: string, ids: string[]) {
+  if (ids.length === 0) return [];
+  const documents = await prisma.document.findMany({
+    where: { id: { in: ids }, ownerId: userId },
+  });
+  if (documents.length !== new Set(ids).size) {
+    throw new AppError(404, 'One or more documents were not found', 'NOT_FOUND');
+  }
+  return documents;
 }
 
 function toLLMHistory(messages?: Message[]): LLMMessage[] {

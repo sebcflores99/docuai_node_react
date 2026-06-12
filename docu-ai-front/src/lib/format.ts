@@ -15,3 +15,14 @@ export function formatDate(iso: string): string {
     day: 'numeric',
   });
 }
+
+/**
+ * Returns the lowercased file extension (without the dot) for a file name,
+ * or an empty string when there isn't one. e.g. "Report.PDF" -> "pdf".
+ */
+export function fileExtension(fileName?: string | null): string {
+  if (!fileName) return '';
+  const base = fileName.split('/').pop() ?? fileName;
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+}

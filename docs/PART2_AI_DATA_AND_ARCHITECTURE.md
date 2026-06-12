@@ -18,7 +18,7 @@ reliability strategy.
 | Conversation messages (user + assistant) | ✅ | Postgres (`Message`) | Audit trail, multi-turn context, evaluation |
 | Prompt version per message | ✅ | Postgres (`Message.promptVersionId`) | Regression detection, auditability |
 | Model name + token counts per message | ✅ | Postgres (`Message.model`, `promptTokens`, `completionTokens`) | Cost tracking, evaluation |
-| Confidence + grounding sources | ✅ | Postgres (`Message.confidence`, `Message.sources`) | UX signals, quality baseline |
+| Grounding sources per message | ✅ | Postgres (`Message.sources`) | Citations shown in UI; groundedness baseline |
 | Raw OpenAI HTTP responses | ❌ | — | Redundant; structured fields capture what matters |
 | PII from document content | ❌ logged | App logger | Logs contain no document text or user content |
 | User passwords in plaintext | ❌ | — | bcrypt-hashed only |
@@ -78,10 +78,10 @@ Three categories of PII risk and their mitigations:
 
 **Auditability without PII in logs:**
 Every assistant message is linked to a `PromptVersion` row (via
-`promptVersionId`), a model name, token counts, and a confidence score. This
-means every response can be traced back to the exact prompt template that
-produced it — without needing to store or log the raw content anywhere outside
-the database.
+`promptVersionId`), a model name, token counts, and the retrieved `sources`. This
+means every response can be traced back to the exact prompt template and the
+passages that produced it — without needing to store or log the raw content
+anywhere outside the database.
 
 ---
 
@@ -91,21 +91,22 @@ The RAG pipeline is fully implemented:
 
 ```
 User uploads document
-  → chunkDocument() — 500-token chunks, 100-token overlap
-  → embedder.embed()  — OpenAI text-embedding-3-small (1536-dim)
-  → upsertChunks()   — stored in Weaviate with documentId + ownerId metadata
+  → extractText()   — PDF/DOCX/text, with page boundaries
+  → chunkDocument() — ~1000-char chunks, 150-char overlap, page-tagged
+  → embedder.embed()— OpenAI text-embedding-3-small (1536-dim) or mock
+  → upsertChunks()  — stored in Weaviate under the user's tenant
 
 User asks question
-  → sanitizeInput()  — strip control characters
-  → embedder.embed([question])
-  → searchChunks(documentId, queryVector, topK=4)  — cosine similarity
-  → top-K chunks assembled into <context> block
-  → buildMessages()  — injected into prompt with XML delimiters
-  → LLM call         — grounded answer with citations
+  → sanitizeInput()              — strip control characters
+  → general agent decides to call search_documents (LLM tool call)
+  → embedder.embed([query])
+  → searchChunks(tenant, queryVector, topK=6)  — cosine similarity
+  → top-K chunks returned as the tool result
+  → general agent answers from them; sources + page footer attached
 ```
 
-Ownership is enforced at the Weaviate query level (`ownerId` filter) so users
-can only retrieve chunks from their own documents.
+Isolation is enforced by **per-user Weaviate tenants** (keyed by user id), so
+users can only retrieve chunks from their own documents.
 
 ---
 
@@ -116,40 +117,49 @@ can only retrieve chunks from their own documents.
 Quality is measured along three axes, all of which have hooks already in the
 schema:
 
-#### 1. Confidence Distribution (automated)
-Every assistant `Message` stores a `confidence` value (`low | medium | high`,
-normalized to `0 | 0.5 | 1.0` for aggregation). A healthy system should trend
-toward `medium` and `high`:
+#### 1. Retrieval & Groundedness (automated)
+Every assistant `Message` stores the `sources` (the retrieved chunks, each with
+a similarity `score`) that grounded the answer. Two cheap signals fall out of
+this:
+
+- **Retrieval hit rate** — share of document questions that retrieved at least
+  one chunk above a similarity threshold. A drop signals an embedding/retrieval
+  regression or a shift in the kinds of questions users ask.
+- **Mean top-1 similarity** — the average best-match score per prompt version.
 
 ```sql
--- Weekly confidence breakdown per prompt version
+-- Weekly retrieval quality per prompt version
 SELECT
   pv.name,
   pv.version,
-  m.confidence,
-  COUNT(*) AS count
+  AVG(jsonb_array_length(m.sources)) AS avg_sources,
+  COUNT(*) FILTER (WHERE jsonb_array_length(m.sources) = 0) AS ungrounded
 FROM "Message" m
 JOIN "PromptVersion" pv ON m."promptVersionId" = pv.id
 WHERE m.role = 'ASSISTANT'
   AND m."createdAt" > NOW() - INTERVAL '7 days'
-GROUP BY pv.name, pv.version, m.confidence
+GROUP BY pv.name, pv.version
 ORDER BY pv.version DESC;
 ```
 
-A spike in `low` confidence answers signals either a prompt regression or a
-shift in the kinds of documents/questions users are submitting.
+A rise in `ungrounded` answers (no sources) for document-style questions is the
+clearest early warning of a regression.
 
-#### 2. Citation Coverage (automated)
-The `sources` JSON field on each `Message` stores the Weaviate chunks that
-were passed as context. Low citation count on high-confidence answers is a
-hallucination signal:
+#### 2. Groundedness / Citation Coverage (automated)
+Because the answer is built from the retrieved `sources`, we can check that the
+model actually used them. An answer that makes specific factual claims while
+`sources` is empty is a hallucination signal:
 
 ```typescript
 // Automated check after each response
 const suspiciousAnswer =
-  result.confidence === 'high' && result.citations.length === 0;
-if (suspiciousAnswer) metrics.increment('ai.suspicious_citation_gap');
+  looksFactual(result.answer) && result.retrievedChunks.length === 0;
+if (suspiciousAnswer) metrics.increment('ai.ungrounded_answer');
 ```
+
+A stronger (LLM-as-judge) version asks a cheap model whether each sentence in
+the answer is supported by the retrieved passages, producing a groundedness
+score per response.
 
 #### 3. Human / Thumbs Feedback (manual baseline)
 A lightweight `feedback` column (`thumbsUp | thumbsDown | null`) on `Message`
@@ -167,22 +177,24 @@ looks like this:
 **Step 1 — Shadow evaluation before rolling out**
 Before activating a new prompt version, run it in shadow mode against the last
 N real questions (sourced from `Message` rows where `role = 'USER'`) and
-compare confidence distributions and citation counts:
+compare retrieval/groundedness metrics:
 
 ```typescript
 const shadowResults = await Promise.all(
   sampleQuestions.map((q) =>
-    generateAnswer({ question: q.content, context: q.context, promptVersionId: candidate.id })
+    generateAnswer({ question: q.content, searchDocuments: retrieverFor(q.userId) })
   )
 );
-const regressionFlag = shadowResults.filter((r) => r.confidence === 'low').length / shadowResults.length;
-if (regressionFlag > 0.15) throw new Error('Prompt candidate has >15% low-confidence rate — blocked');
+// Block promotion if too many document questions come back ungrounded.
+const ungroundedRate =
+  shadowResults.filter((r) => r.retrievedChunks.length === 0).length / shadowResults.length;
+if (ungroundedRate > 0.15) throw new Error('Prompt candidate ungrounded on >15% of questions — blocked');
 ```
 
 **Step 2 — Canary rollout**
 Activate the new `PromptVersion` (`isActive: true`) for a small percentage of
 traffic while keeping the old version running in parallel. Compare live
-confidence and citation metrics between versions in a time-windowed query.
+groundedness and retrieval metrics between versions in a time-windowed query.
 
 **Step 3 — Version pinning for rollback**
 Because `PromptVersion` rows are immutable and messages reference them by ID,
@@ -209,29 +221,30 @@ This is an operational playbook, not just a code concern:
 #### Immediate Detection
 | Signal | Source | Action |
 |--------|--------|--------|
-| `confidence: low` on an answer with citations | DB metric | Flag for human review queue |
-| `citations: []` on `confidence: high` answer | Runtime check | Increment `ai.suspicious_citation_gap` counter; alert if >1% |
+| Factual-looking answer with empty `sources` | Runtime check | Increment `ai.ungrounded_answer`; alert if >1% |
+| Answer says "couldn't find it" on a doc that should match | Retrieval metric | Inspect chunking/embeddings for that document |
 | User thumbs-down feedback | Frontend event | Store on `Message`; route to review queue |
-| LLM returns non-JSON / parse failure | `postProcess()` fallback | Logged as `ai.parse_failure`; answer served with `confidence: low` |
+| Provider/tool error or empty completion | `ai.service` loop | Logged; user gets a safe fallback message |
 
 #### Graceful Degradation (already implemented)
-The `postProcess()` function never throws — if the model returns malformed
-output or plain prose instead of JSON, it wraps the raw text in a `low`
-confidence answer and returns it. Users always get something rather than a 500.
+The agent loop never throws to the user: if retrieval is empty the model is
+told "no relevant passages were found" and answers that it couldn't find the
+answer in their documents; if the model returns nothing usable, a safe fallback
+string is returned. Users always get something rather than a 500.
 
 The prompt itself instructs the model explicitly:
-> "If the answer is not contained in the context, set 'answer' to a brief
-> explanation… Never fabricate facts."
+> "Ground your answer ONLY in the returned passages… If the passages do not
+> contain the answer, say you could not find it. Never fabricate facts."
 
-This means the model's own output declares uncertainty, which the UI can
-surface directly.
+This means the model's own output declares uncertainty, which the UI surfaces
+directly — alongside the citations the user can verify.
 
 #### Incident Response Flow
 
 ```
 Wrong answer reported
   │
-  ├─ 1. Retrieve Message by ID — check promptVersionId, confidence, sources
+  ├─ 1. Retrieve Message by ID — check promptVersionId, sources, model
   │
   ├─ 2. Reproduce: re-run with same question + same context chunks
   │       → is it a retrieval failure (wrong chunks) or a reasoning failure?
@@ -252,11 +265,12 @@ blocks promotion if the pass rate drops:
 
 ```typescript
 // ci/eval.ts
-const goldenSet = loadGoldenSet(); // {question, context, expectedConfidence, forbiddenPhrases}[]
+const goldenSet = loadGoldenSet(); // {question, expectedPhrases, forbiddenPhrases}[]
 for (const sample of goldenSet) {
-  const result = await generateAnswer(sample);
-  assert(result.confidence !== 'low', `Regression on: ${sample.question}`);
-  forbiddenPhrases.forEach((p) => assert(!result.answer.includes(p)));
+  const result = await generateAnswer({ question: sample.question, searchDocuments: testRetriever });
+  assert(result.retrievedChunks.length > 0, `Ungrounded on: ${sample.question}`);
+  sample.expectedPhrases.forEach((p) => assert(result.answer.includes(p)));
+  sample.forbiddenPhrases.forEach((p) => assert(!result.answer.includes(p)));
 }
 ```
 

@@ -11,10 +11,9 @@ describe('MessageBubble', () => {
     expect(screen.getByText('What is the capital of France?')).toBeInTheDocument();
   });
 
-  it('renders an assistant message with confidence, sources, and token metadata', () => {
+  it('renders an assistant message with sources and token metadata', () => {
     render(<MessageBubble message={makeAssistantMessage()} />);
     expect(screen.getByText('Assistant')).toBeInTheDocument();
-    expect(screen.getByText(/High confidence/)).toBeInTheDocument();
     // 1 source passage
     expect(screen.getByText(/1 source passage/)).toBeInTheDocument();
     expect(screen.getByText('France Facts')).toBeInTheDocument();
@@ -22,16 +21,6 @@ describe('MessageBubble', () => {
     // model + total tokens (100 + 20)
     expect(screen.getByText('mock-model')).toBeInTheDocument();
     expect(screen.getByText('120 tokens')).toBeInTheDocument();
-  });
-
-  it('shows an uncertainty warning for low-confidence assistant answers', () => {
-    render(<MessageBubble message={makeAssistantMessage({ confidence: 0.3 })} />);
-    expect(screen.getByRole('note')).toHaveTextContent(/isn't confident/i);
-  });
-
-  it('does not warn for high-confidence answers', () => {
-    render(<MessageBubble message={makeAssistantMessage({ confidence: 0.9 })} />);
-    expect(screen.queryByRole('note')).not.toBeInTheDocument();
   });
 
   it('omits the sources section when there are none', () => {

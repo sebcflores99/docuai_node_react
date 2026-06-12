@@ -2,6 +2,8 @@ import bcrypt from 'bcrypt';
 import { prisma } from '../config/prisma';
 import { AppError, conflict, unauthorized } from '../lib/errors';
 import { signAccessToken } from '../lib/jwt';
+import { logger } from '../lib/logger';
+import { ensureTenant } from './rag/weaviate';
 import type { LoginInput, SignupInput } from '../api/validators/auth.schema';
 
 const SALT_ROUNDS = 12;
@@ -28,6 +30,16 @@ export async function signup(input: SignupInput): Promise<AuthResult> {
   const user = await prisma.user.create({
     data: { email: input.email, passwordHash },
     select: { id: true, email: true, createdAt: true },
+  });
+
+  // Provision the user's isolated vector tenant up front. Best-effort: it is
+  // also created lazily on first document ingest, so a transient vector-store
+  // outage must not block signup.
+  await ensureTenant(user.id).catch((err) => {
+    logger.warn('tenant.provision_failed', {
+      userId: user.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 
   const token = signAccessToken({ sub: user.id, email: user.email });

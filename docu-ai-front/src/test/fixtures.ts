@@ -44,7 +44,6 @@ export function makeAssistantMessage(overrides: Partial<Message> = {}): Message 
     model: 'mock-model',
     promptTokens: 100,
     completionTokens: 20,
-    confidence: 0.9,
     sources: [
       {
         documentId: 'doc-1',

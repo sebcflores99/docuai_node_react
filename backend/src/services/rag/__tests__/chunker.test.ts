@@ -55,3 +55,14 @@ describe('chunkDocument', () => {
     expect(chunks[0].text).toContain('Line two.');
   });
 });
+
+describe('chunkDocument with explicit page boundaries', () => {
+  it('assigns pages from supplied boundaries instead of synthetic ones', () => {
+    const content = 'AAAA\n\nBBBB\n\nCCCC';
+    // pages start at offsets 0, 6, 12
+    const chunks = chunkDocument(content, [0, 6, 12]);
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    const last = chunks[chunks.length - 1];
+    expect(last.pageEnd).toBe(3);
+  });
+});

@@ -32,7 +32,11 @@ function getClient(): WeaviateClient {
 
 let schemaReady = false;
 
-/** Idempotently ensures the DocumentChunk class exists (vectorizer: none). */
+/**
+ * Idempotently ensures the DocumentChunk class exists. The class is
+ * multi-tenant: each user's chunks live in their own tenant (keyed by user id),
+ * so retrieval is hard-isolated per user rather than relying solely on a filter.
+ */
 export async function ensureSchema(): Promise<void> {
   if (schemaReady) return;
   const c = getClient();
@@ -45,6 +49,7 @@ export async function ensureSchema(): Promise<void> {
         class: CLASS_NAME,
         description: 'A chunk of a user document, embedded for retrieval.',
         vectorizer: 'none',
+        multiTenancyConfig: { enabled: true },
         properties: [
           { name: 'documentId', dataType: ['text'] },
           { name: 'ownerId', dataType: ['text'] },
@@ -60,15 +65,37 @@ export async function ensureSchema(): Promise<void> {
   schemaReady = true;
 }
 
-/** Stores chunk records with their precomputed vectors. */
+// Tenants we've already created this process, to avoid redundant round-trips.
+const ensuredTenants = new Set<string>();
+
+/**
+ * Idempotently ensures a per-user tenant exists. Safe to call before every
+ * write/read; creation is skipped once we've seen the tenant in this process.
+ */
+export async function ensureTenant(tenant: string): Promise<void> {
+  if (!tenant) throw new Error('A tenant id is required');
+  await ensureSchema();
+  if (ensuredTenants.has(tenant)) return;
+  const c = getClient();
+  const existing = await c.schema.tenantsGetter(CLASS_NAME).do();
+  const present = existing.some((t) => t.name === tenant);
+  if (!present) {
+    await c.schema.tenantsCreator(CLASS_NAME, [{ name: tenant }]).do();
+  }
+  ensuredTenants.add(tenant);
+}
+
+/** Stores chunk records with their precomputed vectors into the owner's tenant. */
 export async function upsertChunks(records: ChunkRecord[], vectors: number[][]): Promise<void> {
   if (records.length === 0) return;
-  await ensureSchema();
+  const tenant = records[0].ownerId;
+  await ensureTenant(tenant);
   const c = getClient();
   let batcher = c.batch.objectsBatcher();
   records.forEach((record, i) => {
     batcher = batcher.withObject({
       class: CLASS_NAME,
+      tenant,
       properties: { ...record },
       vector: vectors[i],
     });
@@ -76,26 +103,45 @@ export async function upsertChunks(records: ChunkRecord[], vectors: number[][]):
   await batcher.do();
 }
 
-/** Vector search for the most relevant chunks within a single document. */
+export interface SearchScope {
+  ownerId: string;
+  /** Restrict to these document ids; empty/undefined = all of the owner's docs. */
+  documentIds?: string[];
+}
+
+/**
+ * Vector search for the most relevant chunks. Always scoped to the owner; when
+ * `documentIds` is provided, retrieval is further restricted to that subset
+ * (enabling both single- and cross-document conversations).
+ */
 export async function searchChunks(
-  documentId: string,
+  scope: SearchScope,
   queryVector: number[],
   limit: number,
 ): Promise<RetrievedChunk[]> {
-  await ensureSchema();
+  await ensureTenant(scope.ownerId);
   const c = getClient();
-  const result = await c.graphql
+
+  let getter = c.graphql
     .get()
     .withClassName(CLASS_NAME)
-    .withFields('documentId ownerId title text chunkIndex pageStart pageEnd _additional { distance }')
+    .withTenant(scope.ownerId)
+    .withFields(
+      'documentId ownerId title text chunkIndex pageStart pageEnd _additional { distance }',
+    )
     .withNearVector({ vector: queryVector })
-    .withWhere({
+    .withLimit(limit);
+
+  // Tenancy already isolates by user; only narrow further by document subset.
+  if (scope.documentIds && scope.documentIds.length > 0) {
+    getter = getter.withWhere({
       path: ['documentId'],
-      operator: 'Equal',
-      valueText: documentId,
-    })
-    .withLimit(limit)
-    .do();
+      operator: 'ContainsAny',
+      valueTextArray: scope.documentIds,
+    });
+  }
+
+  const result = await getter.do();
 
   const items = result?.data?.Get?.[CLASS_NAME] ?? [];
   return items.map((item: Record<string, unknown>) => {
@@ -113,13 +159,17 @@ export async function searchChunks(
   });
 }
 
-/** Removes all chunks belonging to a document (used on delete/re-ingest). */
-export async function deleteDocumentChunks(documentId: string): Promise<void> {
-  await ensureSchema();
+/** Removes all chunks belonging to a document within its owner's tenant. */
+export async function deleteDocumentChunks(
+  documentId: string,
+  ownerId: string,
+): Promise<void> {
+  await ensureTenant(ownerId);
   const c = getClient();
   await c.batch
     .objectsBatchDeleter()
     .withClassName(CLASS_NAME)
+    .withTenant(ownerId)
     .withWhere({ path: ['documentId'], operator: 'Equal', valueText: documentId })
     .do();
 }

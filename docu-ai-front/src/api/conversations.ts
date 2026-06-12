@@ -9,6 +9,18 @@ export function getConversation(id: string): Promise<Conversation> {
   return apiRequest<Conversation>(`/conversations/${id}`);
 }
 
+export function deleteConversation(id: string): Promise<void> {
+  return apiRequest<void>(`/conversations/${id}`, { method: 'DELETE' });
+}
+
+/** Renames a conversation. */
+export function renameConversation(id: string, title: string): Promise<Conversation> {
+  return apiRequest<Conversation>(`/conversations/${id}`, {
+    method: 'PATCH',
+    body: { title },
+  });
+}
+
 /**
  * Creates a cross-document conversation. With no documentIds the assistant
  * retrieves across all of the user's READY documents; pass documentIds to

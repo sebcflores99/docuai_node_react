@@ -1,7 +1,7 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "DocuAI backend \u2014 AI-assisted document Q&A API",
+  "description": "DocuAI backend — AI-assisted document Q&A API",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -21,10 +21,12 @@
     "@anthropic-ai/sdk": "^0.104.1",
     "@prisma/client": "^6.1.0",
     "bcrypt": "^6.0.0",
-    "dotenv": "^17.0.0",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.3",
+    "mammoth": "^1.12.0",
+    "multer": "^2.1.1",
     "openai": "^6.42.0",
+    "pdfjs-dist": "^6.0.227",
     "weaviate-ts-client": "^2.2.0",
     "zod": "^4.4.3"
   },
@@ -32,6 +34,7 @@
     "@types/bcrypt": "^6.0.0",
     "@types/express": "^5.0.0",
     "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.1.0",
     "@types/node": "^24.12.3",
     "prisma": "^6.1.0",
     "tsx": "^4.20.0",

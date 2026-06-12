@@ -54,8 +54,7 @@ export interface Message {
   model?: string | null;
   promptTokens?: number | null;
   completionTokens?: number | null;
-  // AI-aware UX metadata (assistant messages only).
-  confidence?: number | null;
+  // Grounding passages (assistant messages only).
   sources?: MessageSource[];
   createdAt: string;
 }

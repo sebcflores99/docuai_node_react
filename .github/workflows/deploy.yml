@@ -1,0 +1,140 @@
+# DocuAI — build & deploy to AWS (mock / reference pipeline).
+#
+# Flow: authenticate via GitHub OIDC (no static AWS keys) -> build & push the
+# backend image to ECR -> deploy the CloudFormation stack -> build the SPA and
+# sync it to S3 -> invalidate the CloudFront cache.
+#
+# Required repo configuration (Settings -> Secrets and variables -> Actions):
+#   Variables: AWS_REGION, AWS_DEPLOY_ROLE_ARN, GITHUB_ORG
+# The deploy role ARN is an output of the CloudFormation stack
+# (GitHubDeployRoleArn). On the very first run the stack is created with
+# DeployBackendService=false (ECR is still empty); subsequent runs flip it to
+# true so App Runner + the CloudFront /api origin are provisioned.
+
+name: deploy
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      deploy_backend:
+        description: 'Provision/redeploy the App Runner backend (set true once an image exists).'
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  PROJECT_NAME: docuai
+  ENVIRONMENT_NAME: prod
+  STACK_NAME: docuai-prod
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_REPO="$REGISTRY/${PROJECT_NAME}-backend"
+          docker build \
+            -f backend/backend.Dockerfile \
+            -t "$IMAGE_REPO:$IMAGE_TAG" \
+            -t "$IMAGE_REPO:latest" \
+            backend
+          docker push "$IMAGE_REPO:$IMAGE_TAG"
+          docker push "$IMAGE_REPO:latest"
+
+      - name: Determine backend deploy flag
+        id: flags
+        run: |
+          # On manual runs honour the input; on push always deploy the backend.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "deploy_backend=${{ inputs.deploy_backend }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_backend=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/cloudformation/docuai-stack.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ProjectName="$PROJECT_NAME" \
+              EnvironmentName="$ENVIRONMENT_NAME" \
+              GitHubOrg="${{ vars.GITHUB_ORG }}" \
+              GitHubRepo="${{ github.event.repository.name }}" \
+              GitHubBranch=main \
+              BackendImageTag="${{ github.sha }}" \
+              DeployBackendService="${{ steps.flags.outputs.deploy_backend }}"
+
+      - name: Read stack outputs
+        id: outputs
+        run: |
+          get() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          {
+            echo "frontend_bucket=$(get FrontendBucketName)"
+            echo "distribution_id=$(get DistributionId)"
+            echo "cloudfront_domain=$(get CloudFrontDomain)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: corepack enable
+
+      - name: Build frontend
+        working-directory: docu-ai-front
+        env:
+          # Same-origin via CloudFront: the SPA calls /api/* and CloudFront
+          # routes it to App Runner, so no API base URL is baked in.
+          VITE_API_URL: /api
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Sync SPA to S3
+        run: |
+          aws s3 sync docu-ai-front/dist "s3://${{ steps.outputs.outputs.frontend_bucket }}" --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.outputs.outputs.distribution_id }}" \
+            --paths '/*'
+
+      - name: Summary
+        run: |
+          echo "Deployed to ${{ steps.outputs.outputs.cloudfront_domain }}" >> "$GITHUB_STEP_SUMMARY"

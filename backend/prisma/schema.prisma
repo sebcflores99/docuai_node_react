@@ -28,9 +28,16 @@ model Document {
   // Original extracted text. Chunked + embedded into Weaviate for retrieval.
   content       String
   status        DocumentStatus @default(PENDING)
+  // Ingestion progress 0..100 (null = indeterminate) for the upload UX.
+  progress      Int?
+  // Original upload metadata (optional; populated for file uploads).
+  fileName      String?
+  mimeType      String?
+  sizeBytes     Int?
+  // Populated when status is FAILED.
+  error         String?
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
-  conversations Conversation[]
 
   @@index([ownerId])
 }
@@ -39,15 +46,16 @@ model Conversation {
   id         String    @id @default(uuid())
   userId     String
   user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  documentId String?
-  document   Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  // Optional retrieval scope. Empty = search across all the user's READY docs.
+  // Stored as a scalar list rather than a FK relation so a conversation can
+  // span multiple documents without a join table.
+  documentIds String[] @default([])
   title      String?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   messages   Message[]
 
   @@index([userId])
-  @@index([documentId])
 }
 
 model Message {
@@ -63,9 +71,7 @@ model Message {
   model            String?
   promptTokens     Int?
   completionTokens Int?
-  // AI-aware UX metadata (assistant messages). Confidence is normalized 0..1;
-  // sources holds the grounding passages (MessageSource[]) shown in the UI.
-  confidence       Float?
+  // Grounding passages (MessageSource[]) shown in the UI for assistant messages.
   sources          Json?
   createdAt        DateTime       @default(now())
 

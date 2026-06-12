@@ -1,0 +1,642 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DocuAI — production deployment (mock / reference). Provisions the full stack:
+  VPC + private networking, RDS PostgreSQL, Secrets Manager, ECR, App Runner
+  (backend), S3 (uploaded documents + SPA static hosting), CloudFront
+  (dual-origin: S3 for static, App Runner for /api/*), and a GitHub Actions
+  OIDC deploy role. Weaviate runs as an external managed service (Weaviate
+  Cloud); its URL + API key are supplied via Secrets Manager.
+
+# ---------------------------------------------------------------------------
+# Parameters — environment-specific config (NEVER secrets). Real secret values
+# are set out-of-band into Secrets Manager (see infra/README.md).
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: docuai
+    Description: Prefix used to name and tag all resources.
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Logical environment for this stack.
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub org/user that owns the repo (for OIDC trust).
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (for OIDC trust).
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the deploy role.
+
+  BackendImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      ECR image tag for the backend (CI passes the commit SHA). On the very
+      first deploy the ECR repo is empty, so App Runner creation is gated by
+      the CreateBackendService condition below.
+
+  DeployBackendService:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to 'true' only after the first backend image has been pushed to ECR.
+      Avoids an App Runner failure on the bootstrap deploy when the repo is empty.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class.
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    Description: RDS allocated storage (GiB).
+
+  AppRunnerCpu:
+    Type: String
+    Default: '1 vCPU'
+    AllowedValues: ['0.25 vCPU', '0.5 vCPU', '1 vCPU', '2 vCPU', '4 vCPU']
+
+  AppRunnerMemory:
+    Type: String
+    Default: '2 GB'
+    AllowedValues: ['0.5 GB', '1 GB', '2 GB', '3 GB', '4 GB', '6 GB', '8 GB', '10 GB', '12 GB']
+
+  AppRunnerMaxConcurrency:
+    Type: Number
+    Default: 50
+    Description: Requests per instance before App Runner scales out.
+
+  AppRunnerMinSize:
+    Type: Number
+    Default: 1
+
+  AppRunnerMaxSize:
+    Type: Number
+    Default: 5
+
+Conditions:
+  CreateBackendService: !Equals [!Ref DeployBackendService, 'true']
+
+Resources:
+  # =========================================================================
+  # Networking — a minimal VPC with two private subnets for RDS and the
+  # App Runner VPC Connector. No public ingress to the data tier.
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-vpc' }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-private-a' }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-private-b' }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-private-rt' }
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # Security group for the App Runner VPC Connector (egress to RDS).
+  ConnectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App Runner VPC connector egress to RDS.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+          Description: Postgres to the data tier.
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-connector-sg' }
+
+  # RDS only accepts Postgres from the connector SG — nothing else.
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Postgres - ingress only from the App Runner connector.
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-db-sg' }
+
+  DatabaseIngressFromConnector:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ConnectorSecurityGroup
+      Description: Postgres from the App Runner VPC connector only.
+
+  # =========================================================================
+  # Secrets — RDS master credentials (generated) + application secrets.
+  # No secret material is stored in this template or in source control.
+  # =========================================================================
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/rds'
+      Description: RDS master credentials (auto-generated).
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"docuai_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # App secrets are created with PLACEHOLDER values and updated out-of-band
+  # (CLI/console) after stack creation. Real values never live in code.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/app'
+      Description: Application secrets (JWT, OpenAI, Weaviate). Set real values out-of-band.
+      SecretString: |
+        {
+          "JWT_SECRET": "REPLACE_ME",
+          "OPENAI_API_KEY": "REPLACE_ME",
+          "WEAVIATE_URL": "https://REPLACE_ME.weaviate.cloud",
+          "WEAVIATE_API_KEY": "REPLACE_ME"
+        }
+
+  # =========================================================================
+  # Data — RDS PostgreSQL in private subnets, encrypted, not publicly reachable.
+  # =========================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName}-${EnvironmentName} private DB subnets'
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}'
+      Engine: postgres
+      EngineVersion: '16.8'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBName: docuai
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-rds' }
+
+  # =========================================================================
+  # Container registry for the backend image.
+  # =========================================================================
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-backend'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # =========================================================================
+  # Uploaded documents bucket — private, encrypted, versioned.
+  # NOTE: The application currently stores extracted text in Postgres. Wiring
+  # raw uploads to this bucket is a documented follow-up (see infra/README.md);
+  # the bucket + IAM are provisioned here so that change is config-only.
+  # =========================================================================
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-documents-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # =========================================================================
+  # Backend — App Runner pulling from ECR, reaching RDS over a VPC Connector.
+  # =========================================================================
+  # Role App Runner uses to PULL the image from ECR.
+  AppRunnerEcrAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-apprunner-ecr'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  # Runtime instance role — least-privilege access to secrets + docs bucket.
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-apprunner-instance'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: secrets-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref AppSecret
+                  - !Ref DatabaseSecret
+        - PolicyName: documents-bucket-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${DocumentsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DocumentsBucket.Arn
+
+  AppRunnerVpcConnector:
+    Type: AWS::AppRunner::VpcConnector
+    Properties:
+      VpcConnectorName: !Sub '${ProjectName}-${EnvironmentName}-connector'
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref ConnectorSecurityGroup
+
+  BackendService:
+    Type: AWS::AppRunner::Service
+    Condition: CreateBackendService
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${EnvironmentName}-backend'
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerEcrAccessRole.Arn
+        AutoDeploymentsEnabled: false
+        ImageRepository:
+          ImageRepositoryType: ECR
+          ImageIdentifier: !Sub '${BackendRepository.RepositoryUri}:${BackendImageTag}'
+          ImageConfiguration:
+            Port: '8000'
+            RuntimeEnvironmentVariables:
+              - { Name: NODE_ENV, Value: production }
+              - { Name: PORT, Value: '8000' }
+              # Postgres connection assembled from the RDS secret + endpoint.
+              - Name: DATABASE_URL
+                Value: !Sub
+                  - 'postgresql://{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}:{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}@${Endpoint}:5432/docuai'
+                  - Endpoint: !GetAtt Database.Endpoint.Address
+            RuntimeEnvironmentSecrets:
+              - { Name: JWT_SECRET, Value: !Sub '${AppSecret}:JWT_SECRET::' }
+              - { Name: OPENAI_API_KEY, Value: !Sub '${AppSecret}:OPENAI_API_KEY::' }
+              - { Name: WEAVIATE_URL, Value: !Sub '${AppSecret}:WEAVIATE_URL::' }
+              - { Name: WEAVIATE_API_KEY, Value: !Sub '${AppSecret}:WEAVIATE_API_KEY::' }
+      InstanceConfiguration:
+        Cpu: !Ref AppRunnerCpu
+        Memory: !Ref AppRunnerMemory
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /api/health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: VPC
+          VpcConnectorArn: !GetAtt AppRunnerVpcConnector.VpcConnectorArn
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-backend' }
+
+  BackendAutoScaling:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: !Sub '${ProjectName}${EnvironmentName}'
+      MaxConcurrency: !Ref AppRunnerMaxConcurrency
+      MinSize: !Ref AppRunnerMinSize
+      MaxSize: !Ref AppRunnerMaxSize
+
+  # =========================================================================
+  # Frontend — private S3 bucket served only through CloudFront via OAC.
+  # =========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-frontend-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Cache static assets; never cache the API.
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-static'
+        DefaultTTL: 86400
+        MinTTL: 0
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig: { CookieBehavior: none }
+          HeadersConfig: { HeaderBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName}-${EnvironmentName} SPA + API'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          # Static SPA from S3 (locked down via OAC).
+          - Id: s3-frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          # API origin — only present once the backend service exists.
+          - !If
+            - CreateBackendService
+            - Id: apprunner-api
+              DomainName: !GetAtt BackendService.ServiceUrl
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+                HTTPSPort: 443
+            - !Ref AWS::NoValue
+        DefaultCacheBehavior:
+          TargetOriginId: s3-frontend
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref StaticCachePolicy
+          Compress: true
+        CacheBehaviors:
+          - !If
+            - CreateBackendService
+            - PathPattern: /api/*
+              TargetOriginId: apprunner-api
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              # AllViewerExceptHostHeader managed policy — forwards everything
+              # the API needs (auth header, query, cookies) but not Host.
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              # CachingDisabled managed policy.
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              Compress: true
+            - !Ref AWS::NoValue
+        CustomErrorResponses:
+          # SPA client-side routing — serve index.html for 403/404 from S3.
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # Allow only this CloudFront distribution to read the frontend bucket.
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution.Id}'
+
+  # =========================================================================
+  # CI — GitHub Actions OIDC provider + deploy role (no long-lived keys).
+  # =========================================================================
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # GitHub's OIDC thumbprint. IAM also validates the cert chain, so this
+        # is effectively a formality, but the field is required.
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-github-deploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: deploy-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Push backend images to ECR.
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt BackendRepository.Arn
+              # Deploy this CloudFormation stack.
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${EnvironmentName}/*'
+              # Publish the SPA build + invalidate the CDN cache.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FrontendBucket.Arn
+                  - !Sub '${FrontendBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution.Id}'
+
+Outputs:
+  CloudFrontDomain:
+    Description: Public URL for the application (SPA + /api).
+    Value: !Sub 'https://${Distribution.DomainName}'
+
+  DistributionId:
+    Description: CloudFront distribution id (used for cache invalidation in CI).
+    Value: !Ref Distribution
+
+  BackendServiceUrl:
+    Condition: CreateBackendService
+    Description: App Runner service URL (internal origin for CloudFront).
+    Value: !Sub 'https://${BackendService.ServiceUrl}'
+
+  EcrRepositoryUri:
+    Description: ECR repository URI for the backend image.
+    Value: !GetAtt BackendRepository.RepositoryUri
+
+  DocumentsBucketName:
+    Description: S3 bucket for uploaded documents.
+    Value: !Ref DocumentsBucket
+
+  FrontendBucketName:
+    Description: S3 bucket for the SPA build (CI syncs here).
+    Value: !Ref FrontendBucket
+
+  DatabaseEndpoint:
+    Description: RDS endpoint (private).
+    Value: !GetAtt Database.Endpoint.Address
+
+  GitHubDeployRoleArn:
+    Description: Role ARN for GitHub Actions to assume via OIDC.
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  AppSecretArn:
+    Description: Secrets Manager ARN holding app secrets (set real values out-of-band).
+    Value: !Ref AppSecret
